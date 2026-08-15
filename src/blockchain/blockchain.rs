@@ -1,5 +1,6 @@
 use crate::address::{Address, Balances, COINBASE};
 use crate::block::Block;
+use crate::blockchain::utils::get_new_balances_by_tx_members_roles;
 use crate::blockchain::validator::BlockchainValidator;
 use crate::config::{GenesisConfig, GenesisData};
 use crate::mempool::Mempool;
@@ -16,7 +17,7 @@ pub struct Blockchain {
     pub initial_balances: Balances,
     pub nonces: HashMap<Address, u64>,
     pub initial_nonces: HashMap<Address, u64>,
-    pub max_transactions: usize,
+    pub max_block_weight: usize,
 }
 
 const COINBASE_TRANSACTION_COUNT: usize = 1;
@@ -27,7 +28,7 @@ impl Blockchain {
         let GenesisData {
             mut genesis_block,
             initial_balances,
-            max_transactions,
+            max_block_weight,
         } = genesis_data;
         genesis_block.mine_block(difficulty);
         chain.push(genesis_block);
@@ -41,7 +42,7 @@ impl Blockchain {
             initial_balances,
             nonces: HashMap::new(),
             initial_nonces: HashMap::new(),
-            max_transactions,
+            max_block_weight,
         }
     }
 
@@ -57,13 +58,19 @@ impl Blockchain {
     }
 
     pub fn add_transaction(&mut self, transaction: Transaction) -> bool {
+        if transaction.from == COINBASE {
+            return false;
+        }
+
         let from_balance = self.balances.get(&transaction.from).copied().unwrap_or(0);
         let current_nonce = self.nonces.get(&transaction.from).copied().unwrap_or(0);
 
         let pending_count = self.mempool.pending_count(&transaction.from);
 
         /* Даем возможность отправить несколько транзакций в mempool */
-        let expected_nonce = current_nonce + pending_count;
+        let Some(expected_nonce) = current_nonce.checked_add(pending_count) else {
+            return false;
+        };
 
         /* Проверяем, что nonce в порядке */
         if transaction.nonce != expected_nonce {
@@ -94,9 +101,7 @@ impl Blockchain {
             return false;
         };
 
-        self.mempool.insert(transaction);
-
-        true
+        self.mempool.insert(transaction)
     }
 
     fn pay_miner_reward(&mut self, transaction: &Transaction) {
@@ -125,8 +130,15 @@ impl Blockchain {
     }
 
     pub fn mine_pending_transactions(&mut self, miner_address: Address) {
+        /* Из максимальной весовой емкости вычитываем сперва вес Coinbase транзакции */
+        let Some(available_weight) = self.max_block_weight.checked_sub(Transaction::FIXED_WEIGHT)
+        else {
+            return;
+        };
 
-        let mut pending_transactions = self.mempool.select_transactions(self.max_transactions, &self.nonces);
+        let mut pending_transactions = self
+            .mempool
+            .select_transactions(available_weight, &self.nonces);
 
         if pending_transactions.is_empty() {
             return;
@@ -151,7 +163,8 @@ impl Blockchain {
         for transaction in &transactions {
             self.apply_transaction(transaction);
         }
-        self.mempool.remove_selected_transactions(&transactions[COINBASE_TRANSACTION_COUNT..])
+        self.mempool
+            .remove_selected_transactions(&transactions[COINBASE_TRANSACTION_COUNT..])
     }
 
     pub fn apply_transaction(&mut self, transaction: &Transaction) {
@@ -160,33 +173,43 @@ impl Blockchain {
             return;
         }
 
-        let from_balance = self.balances.get(&transaction.from).copied().unwrap_or(0);
-        let Some(total_cost) = transaction.amount.checked_add(transaction.fee) else {
+        let Some((from_new, to_new)) =
+            get_new_balances_by_tx_members_roles(&self.balances, transaction)
+        else {
             return;
         };
-
-        let to_balance = self.balances.get(&transaction.to).copied().unwrap_or(0);
-        let Some(to_balance_new) = to_balance.checked_add(transaction.amount) else {
-            return;
-        };
-
-        if from_balance < total_cost {
-            return;
-        }
-
-        self.balances
-            .insert(transaction.from, from_balance - total_cost);
-
-        self.balances.insert(transaction.to, to_balance_new);
 
         let nonce = self.nonces.get(&transaction.from).copied().unwrap_or(0);
-        self.nonces.insert(transaction.from, nonce + 1);
+
+        let Some(next_nonce) = nonce.checked_add(1) else {
+            return;
+        };
+
+        self.balances.insert(transaction.from, from_new);
+
+        self.balances.insert(transaction.to, to_new);
+
+        self.nonces.insert(transaction.from, next_nonce);
     }
 
     pub fn is_valid(&self) -> bool {
+        /* Проверяем вес генезис-блока */
+        let Some(genesis_block) = self.chain.first() else {
+            return false;
+        };
+
+        if !BlockchainValidator::check_block_weight(genesis_block, self.max_block_weight) {
+            return false;
+        }
+
+        /* Проверяем вес и транзакции остальных блоков */
         for index in 1..self.chain.len() {
             let current_block = &self.chain[index];
             let previous_block = &self.chain[index - 1];
+
+            if !BlockchainValidator::check_block_weight(current_block, self.max_block_weight) {
+                return false;
+            }
 
             let is_valid_coinbase_transaction = BlockchainValidator::check_coinbase_transaction(
                 current_block,

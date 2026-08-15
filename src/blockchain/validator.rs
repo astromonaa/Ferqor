@@ -1,12 +1,20 @@
 use crate::address::{Address, Balances};
 use crate::block::Block;
 use crate::blockchain::Blockchain;
+use crate::blockchain::utils::get_new_balances_by_tx_members_roles;
 use crate::transaction::Transaction;
 use std::collections::HashMap;
 
 pub struct BlockchainValidator;
 
 impl BlockchainValidator {
+    pub fn check_block_weight(block: &Block, max_block_weight: usize) -> bool {
+        matches!(
+            block.weight(),
+            Some(weight) if weight <= max_block_weight
+        )
+    }
+
     pub fn check_coinbase_transaction(
         current_block: &Block,
         mining_reward: u64,
@@ -68,30 +76,24 @@ impl BlockchainValidator {
 
             let current_nonce = nonces.get(&transaction.from).copied().unwrap_or(0);
 
+            let Some(next_nonce) = current_nonce.checked_add(1) else {
+                return false;
+            };
+
             if current_nonce != transaction.nonce {
                 return false;
             }
 
-            let from_balance = balances.get(&transaction.from).copied().unwrap_or(0);
-            let fee = transaction.fee;
-
-            let to_balance = balances.get(&transaction.to).copied().unwrap_or(0);
-            let Some(to_balance_new) = to_balance.checked_add(transaction.amount) else {
+            let Some((from_balance_new, to_balance_new)) =
+                get_new_balances_by_tx_members_roles(&balances, transaction)
+            else {
                 return false;
             };
 
-            let Some(total_amount) = transaction.amount.checked_add(fee) else {
-                return false;
-            };
-
-            if from_balance < total_amount {
-                return false;
-            }
-
-            balances.insert(transaction.from, from_balance - total_amount);
+            balances.insert(transaction.from, from_balance_new);
             balances.insert(transaction.to, to_balance_new);
 
-            nonces.insert(transaction.from, current_nonce + 1);
+            nonces.insert(transaction.from, next_nonce);
 
             true
         }

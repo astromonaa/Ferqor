@@ -37,6 +37,8 @@ pub struct Transaction {
 
 impl Transaction {
 
+    pub const FIXED_WEIGHT: usize = 1;
+
     pub fn txid(&self) -> TransactionId {
         let mut hasher = Sha256::new();
         hasher.update(self.from.0);
@@ -100,5 +102,9 @@ impl Transaction {
 
         let payload_hash = Transaction::hash_payload(&self.from, &self.to, self.amount, self.fee, self.nonce);
         public_key.verify(&payload_hash, signature).is_ok()
+    }
+
+    pub fn weight(&self) -> usize {
+        Self::FIXED_WEIGHT
     }
 }

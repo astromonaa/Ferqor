@@ -1,17 +1,13 @@
 use crate::address::Address;
 use crate::transaction::{Transaction, TransactionId};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
-use std::cmp::{Reverse};
 use std::sync::Arc;
 
 pub type TransactionMap = HashMap<TransactionId, Arc<Transaction>>;
 pub type SenderMap = HashMap<Address, BTreeMap<u64, TransactionId>>;
 
-type MineCandidate = (
-    u64,
-    Reverse<u64>,
-    TransactionId,
-);
+type MineCandidate = (u64, Reverse<u64>, TransactionId);
 
 pub struct Mempool {
     pub transactions: TransactionMap,
@@ -31,17 +27,27 @@ impl Mempool {
     }
 
     pub fn pending_count(&self, sender: &Address) -> u64 {
-        self.by_sender.get(sender).map(|txs| txs.len() as u64).unwrap_or(0)
+        self.by_sender
+            .get(sender)
+            .map(|txs| txs.len() as u64)
+            .unwrap_or(0)
     }
 
     pub fn pending_cost(&self, sender: &Address) -> Option<u64> {
-        self.by_sender.get(sender)?
-            .values()
-            .try_fold(0u64, |acc, txid| {
-                let tx = self.transactions.get(txid)?;
-                let amount = tx.amount.checked_add(tx.fee)?;
-                acc.checked_add(amount)
-            })
+        let Some(sender_map) = self.by_sender.get(sender) else {
+            return Some(0);
+        };
+
+        sender_map.iter().try_fold(0u64, |acc, (nonce, txid)| {
+            let tx = self.transactions.get(txid)?;
+
+            if tx.from != *sender || tx.nonce != *nonce {
+                return None;
+            }
+
+            let amount = tx.amount.checked_add(tx.fee)?;
+            acc.checked_add(amount)
+        })
     }
 
     pub fn insert(&mut self, transaction: Transaction) -> bool {
@@ -51,9 +57,7 @@ impl Mempool {
             return false;
         }
 
-        let sender_map = self.by_sender
-            .entry(transaction.from)
-            .or_default();
+        let sender_map = self.by_sender.entry(transaction.from).or_default();
 
         if sender_map.contains_key(&transaction.nonce) {
             return false;
@@ -67,26 +71,41 @@ impl Mempool {
     }
 
     pub fn remove(&mut self, txid: &TransactionId) -> bool {
-        let Some(tx) = self.transactions.remove(txid) else {
+        let (sender, nonce) = {
+            let Some(tx) = self.transactions.get(txid) else {
+                return false;
+            };
+            (tx.from, tx.nonce)
+        };
+
+        let Some(sender_map) = self.by_sender.get_mut(&sender) else {
             return false;
         };
 
-        let Some(sender_map) = self.by_sender.get_mut(&tx.from) else {
+        let Some(found_txid) = sender_map.get(&nonce) else {
             return false;
         };
 
-        if sender_map.remove(&tx.nonce).is_none() {
+        if found_txid != txid {
             return false;
         }
 
+        self.transactions.remove(txid);
+        sender_map.remove(&nonce);
+
         if sender_map.is_empty() {
-            self.by_sender.remove(&tx.from);
+            self.by_sender.remove(&sender);
         }
 
         true
     }
 
-    fn push_candidate(&self, heap: &mut BinaryHeap<MineCandidate>, sender_map: &BTreeMap<u64, TransactionId>, nonce: u64) {
+    fn push_candidate(
+        &self,
+        heap: &mut BinaryHeap<MineCandidate>,
+        sender_map: &BTreeMap<u64, TransactionId>,
+        nonce: u64,
+    ) {
         let Some(transaction_id) = sender_map.get(&nonce) else {
             return;
         };
@@ -100,29 +119,36 @@ impl Mempool {
 
     pub fn select_transactions(
         &self,
-        max_transactions: usize,
+        max_block_weight: usize,
         account_nonces: &HashMap<Address, u64>,
     ) -> Vec<Arc<Transaction>> {
         let mut selected = Vec::new();
         let mut binary_heap = BinaryHeap::new();
 
         for (sender, sender_map) in &self.by_sender {
-
             let expected_nonce = account_nonces.get(sender).copied().unwrap_or(0);
 
             self.push_candidate(&mut binary_heap, sender_map, expected_nonce);
         }
 
-        while selected.len() < max_transactions {
+        let mut current_weight: usize = 0;
 
-            let Some((_, Reverse(nonce), txid)) = binary_heap.pop() else {
-                break;
-            };
-
-
+        while let Some((_, Reverse(nonce), txid)) = binary_heap.pop() {
             let Some(best_transaction) = self.transactions.get(&txid) else {
-                continue
+                continue;
             };
+
+            let tx_weight = best_transaction.weight();
+
+            let Some(next_weight) = current_weight.checked_add(tx_weight) else {
+                continue;
+            };
+
+            if next_weight > max_block_weight {
+                continue;
+            };
+
+            current_weight = next_weight;
 
             selected.push(Arc::clone(best_transaction));
 

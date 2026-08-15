@@ -135,4 +135,10 @@ impl Block {
             self.hash = Block::calculate_hash(&self.header)
         }
     }
+
+    pub fn weight(&self) -> Option<usize> {
+        self.transactions
+            .iter()
+            .try_fold(0usize, |acc, tx| acc.checked_add(tx.weight()))
+    }
 }
