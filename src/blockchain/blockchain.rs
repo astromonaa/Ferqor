@@ -1,6 +1,7 @@
 use crate::address::{Address, Balances, COINBASE};
 use crate::block::Block;
-use crate::blockchain::utils::get_new_balances_by_tx_members_roles;
+use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError, MiningError};
+use crate::blockchain::utils::Difficulty;
 use crate::blockchain::validator::BlockchainValidator;
 use crate::config::{GenesisConfig, GenesisData};
 use crate::mempool::Mempool;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
-    pub difficulty: usize,
+    pub difficulty: Difficulty,
     pub mempool: Mempool,
     pub balances: Balances,
     pub mining_reward: u64,
@@ -20,17 +21,18 @@ pub struct Blockchain {
     pub max_block_weight: usize,
 }
 
-const COINBASE_TRANSACTION_COUNT: usize = 1;
-
 impl Blockchain {
-    pub fn new(difficulty: usize, genesis_data: GenesisData) -> Self {
+    pub fn new(genesis_data: GenesisData) -> Self {
         let mut chain = Vec::new();
         let GenesisData {
             mut genesis_block,
             initial_balances,
             max_block_weight,
         } = genesis_data;
-        genesis_block.mine_block(difficulty);
+
+        let difficulty = genesis_block.header.difficulty;
+
+        genesis_block.mine_block();
         chain.push(genesis_block);
 
         Self {
@@ -46,15 +48,67 @@ impl Blockchain {
         }
     }
 
-    pub fn add_block(&mut self, transactions: Vec<Arc<Transaction>>) {
+    fn create_block(
+        &self,
+        transactions: Vec<Arc<Transaction>>,
+    ) -> Result<Block, BlockValidationError> {
         let Some(previous_block) = self.chain.last() else {
-            return;
+            return Err(BlockValidationError::MissingChainTip);
         };
-        let index = previous_block.header.index + 1;
+        let index = previous_block
+            .header
+            .index
+            .checked_add(1)
+            .ok_or(BlockValidationError::IndexOverflow)?;
         let now = GenesisConfig::get_now_timestamp();
-        let mut new_block = Block::new(index, transactions, previous_block.hash, 0, now);
-        new_block.mine_block(self.difficulty);
-        self.chain.push(new_block);
+        let new_block = Block::new(
+            index,
+            transactions,
+            previous_block.hash,
+            0,
+            now,
+            self.difficulty,
+        );
+        Ok(new_block)
+    }
+
+    fn accept_block(
+        &mut self,
+        candidate: Block,
+        next_balances: Balances,
+        next_nonces: HashMap<Address, u64>,
+    ) -> Result<(), BlockAcceptanceError> {
+        /* Проверяем валидность нового блока */
+        BlockchainValidator::validate_next_block(self, &candidate, COINBASE)
+            .map_err(BlockAcceptanceError::Validation)?;
+
+        /* После успешной проверки добавляем блок в цепь */
+        self.balances = next_balances;
+        self.nonces = next_nonces;
+        self.chain.push(candidate);
+        Ok(())
+    }
+
+    pub fn add_block(
+        &mut self,
+        transactions: Vec<Arc<Transaction>>,
+    ) -> Result<(), BlockAcceptanceError> {
+        let mut candidate = self
+            .create_block(transactions)
+            .map_err(BlockAcceptanceError::Validation)?;
+        /* Сперва проверям возможное применение нового блока */
+        let (next_balances, next_nonces) = BlockchainValidator::calculate_next_state(
+            &self.balances,
+            &self.nonces,
+            &candidate,
+            COINBASE,
+        )?;
+
+        /* После успешной проверки майним блок */
+        candidate.mine_block();
+
+        /* После успешного майнинга добавляем блок в цепь */
+        self.accept_block(candidate, next_balances, next_nonces)
     }
 
     pub fn add_transaction(&mut self, transaction: Transaction) -> bool {
@@ -104,14 +158,6 @@ impl Blockchain {
         self.mempool.insert(transaction)
     }
 
-    fn pay_miner_reward(&mut self, transaction: &Transaction) {
-        let miner_balance = self.balances.get(&transaction.to).copied().unwrap_or(0);
-        let Some(new_balance) = miner_balance.checked_add(transaction.amount) else {
-            return;
-        };
-        self.balances.insert(transaction.to, new_balance);
-    }
-
     fn get_reward_transaction(
         &self,
         miner_address: Address,
@@ -129,70 +175,47 @@ impl Blockchain {
         }))
     }
 
-    pub fn mine_pending_transactions(&mut self, miner_address: Address) {
+    pub fn mine_pending_transactions(&mut self, miner_address: Address) -> Result<(), MiningError> {
         /* Из максимальной весовой емкости вычитываем сперва вес Coinbase транзакции */
-        let Some(available_weight) = self.max_block_weight.checked_sub(Transaction::FIXED_WEIGHT)
-        else {
-            return;
-        };
+        let available_weight = self
+            .max_block_weight
+            .checked_sub(Transaction::FIXED_WEIGHT)
+            .ok_or(MiningError::BlockCapacityTooSmall {
+                required: Transaction::FIXED_WEIGHT,
+                max_weight: self.max_block_weight,
+            })?;
 
-        let mut pending_transactions = self
+        let pending_transactions = self
             .mempool
             .select_transactions(available_weight, &self.nonces);
 
         if pending_transactions.is_empty() {
-            return;
+            return Ok(());
         };
 
-        let Some(total_fees) = pending_transactions
+        let total_fees = pending_transactions
             .iter()
             .try_fold(0u64, |acc, tx| acc.checked_add(tx.fee))
-        else {
-            return;
-        };
+            .ok_or(MiningError::FeeOverflow)?;
 
-        let Some(reward_tx) = self.get_reward_transaction(miner_address, total_fees) else {
-            return;
-        };
+        let reward_tx = self
+            .get_reward_transaction(miner_address, total_fees)
+            .ok_or(MiningError::RewardOverflow)?;
 
-        let mut transactions = vec![reward_tx];
-        transactions.append(&mut pending_transactions);
+        let mut transactions = Vec::with_capacity(pending_transactions.len() + 1);
+        transactions.push(reward_tx);
+        transactions.extend(pending_transactions.iter().cloned());
 
-        self.add_block(transactions.clone());
+        self.add_block(transactions)
+            .map_err(MiningError::BlockAcceptance)?;
 
-        for transaction in &transactions {
-            self.apply_transaction(transaction);
-        }
         self.mempool
-            .remove_selected_transactions(&transactions[COINBASE_TRANSACTION_COUNT..])
+            .remove_selected_transactions(&pending_transactions);
+
+        Ok(())
     }
 
-    pub fn apply_transaction(&mut self, transaction: &Transaction) {
-        if transaction.from == COINBASE {
-            self.pay_miner_reward(transaction);
-            return;
-        }
-
-        let Some((from_new, to_new)) =
-            get_new_balances_by_tx_members_roles(&self.balances, transaction)
-        else {
-            return;
-        };
-
-        let nonce = self.nonces.get(&transaction.from).copied().unwrap_or(0);
-
-        let Some(next_nonce) = nonce.checked_add(1) else {
-            return;
-        };
-
-        self.balances.insert(transaction.from, from_new);
-
-        self.balances.insert(transaction.to, to_new);
-
-        self.nonces.insert(transaction.from, next_nonce);
-    }
-
-    pub fn is_valid(&self) -> bool {
+    fn is_valid_genesis_block(&self) -> bool {
         /* Проверяем вес генезис-блока */
         let Some(genesis_block) = self.chain.first() else {
             return false;
@@ -202,6 +225,24 @@ impl Blockchain {
             return false;
         }
 
+        let calculated_hash = Block::calculate_hash(&genesis_block.header);
+
+        if calculated_hash != genesis_block.hash {
+            return false;
+        }
+
+        if !calculated_hash.has_leading_zero_hex_digits(genesis_block.header.difficulty) {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn is_valid(&self) -> bool {
+        /* Проверяем валидность генезис-блока */
+        if !self.is_valid_genesis_block() {
+            return false;
+        }
         /* Проверяем вес и транзакции остальных блоков */
         for index in 1..self.chain.len() {
             let current_block = &self.chain[index];
@@ -225,10 +266,14 @@ impl Blockchain {
                 return false;
             }
 
+            if current_block.header.difficulty != self.difficulty {
+                return false;
+            }
+
             let calculated_hash = Block::calculate_hash(&current_block.header);
 
             let is_valid_hash = calculated_hash == current_block.hash
-                && calculated_hash.has_leading_zero_hex_digits(self.difficulty);
+                && calculated_hash.has_leading_zero_hex_digits(current_block.header.difficulty);
 
             if !is_valid_hash {
                 return false;

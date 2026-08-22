@@ -1,8 +1,10 @@
-use crate::address::{Balances};
+use crate::address::Balances;
 use crate::block::Block;
+use crate::block::block::BlockHash;
+use crate::blockchain::error::BlockchainError;
+use crate::blockchain::utils::{Difficulty, MAX_DIFFICULTY};
 use chrono::Utc;
 use std::collections::HashMap;
-use crate::block::block::BlockHash;
 
 pub struct GenesisConfig {}
 
@@ -20,11 +22,11 @@ impl GenesisConfig {
     }
 
     pub fn initial_balances(balances: Option<Balances>) -> Balances {
-        let extended_balances = match balances { 
+        let extended_balances = match balances {
             Some(balances) => balances,
-            _ => HashMap::new()
+            _ => HashMap::new(),
         };
-        
+
         let mut balances: Balances = HashMap::new();
 
         balances.extend(extended_balances);
@@ -32,15 +34,23 @@ impl GenesisConfig {
         balances
     }
 
-    pub fn get_config(balances: Option<Balances>, max_block_weight: Option<usize>) -> GenesisData {
+    pub fn get_config(
+        balances: Option<Balances>,
+        max_block_weight: Option<usize>,
+        difficulty: Difficulty,
+    ) -> Result<GenesisData, BlockchainError> {
+        if difficulty > MAX_DIFFICULTY {
+            return Err(BlockchainError::InvalidDifficulty);
+        }
+
         let now = GenesisConfig::get_now_timestamp();
-        let genesis_block = Block::new(0, vec![], BlockHash([0u8; 32]), 0, now);
+        let genesis_block = Block::new(0, vec![], BlockHash([0u8; 32]), 0, now, difficulty);
         let initial_balances = GenesisConfig::initial_balances(balances);
 
-        GenesisData {
+        Ok(GenesisData {
             genesis_block,
             initial_balances,
             max_block_weight: max_block_weight.unwrap_or(MAX_BLOCK_WEIGHT),
-        }
+        })
     }
 }

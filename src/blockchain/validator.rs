@@ -1,9 +1,10 @@
+use std::collections::HashMap;
+
 use crate::address::{Address, Balances};
 use crate::block::Block;
 use crate::blockchain::Blockchain;
-use crate::blockchain::utils::get_new_balances_by_tx_members_roles;
-use crate::transaction::Transaction;
-use std::collections::HashMap;
+use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError};
+use crate::blockchain::state_transitions::apply_transaction_to_state;
 
 pub struct BlockchainValidator;
 
@@ -24,7 +25,12 @@ impl BlockchainValidator {
             return false;
         };
 
-        if first_tx.from != coinbase {
+        if first_tx.from != coinbase
+            || first_tx.fee != 0
+            || first_tx.nonce != 0
+            || first_tx.signature.is_some()
+            || first_tx.public_key.is_some()
+        {
             return false;
         }
 
@@ -55,61 +61,112 @@ impl BlockchainValidator {
         coinbase_transactions == 1
     }
 
+    pub fn calculate_next_state(
+        balances: &Balances,
+        nonces: &HashMap<Address, u64>,
+        block: &Block,
+        coinbase: Address,
+    ) -> Result<(Balances, HashMap<Address, u64>), BlockAcceptanceError> {
+        let mut next_balances = balances.clone();
+        let mut next_nonces = nonces.clone();
+
+        for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+            apply_transaction_to_state(transaction, &mut next_balances, &mut next_nonces, coinbase)
+                .map_err(|source| BlockAcceptanceError::StateTransition {
+                    transaction_index,
+                    source,
+                })?
+        }
+
+        Ok((next_balances, next_nonces))
+    }
+
     pub fn validate_state_transitions(blockchain: &Blockchain, coinbase: Address) -> bool {
         let mut balances = blockchain.initial_balances.clone();
         let mut nonces = blockchain.initial_nonces.clone();
 
-        fn apply(
-            transaction: &Transaction,
-            balances: &mut Balances,
-            coinbase: Address,
-            nonces: &mut HashMap<Address, u64>,
-        ) -> bool {
-            if transaction.from == coinbase {
-                let to_balance = balances.get(&transaction.to).copied().unwrap_or(0);
-                let Some(to_balance_new) = to_balance.checked_add(transaction.amount) else {
-                    return false;
-                };
-                balances.insert(transaction.to, to_balance_new);
-                return true;
-            }
-
-            let current_nonce = nonces.get(&transaction.from).copied().unwrap_or(0);
-
-            let Some(next_nonce) = current_nonce.checked_add(1) else {
-                return false;
-            };
-
-            if current_nonce != transaction.nonce {
-                return false;
-            }
-
-            let Some((from_balance_new, to_balance_new)) =
-                get_new_balances_by_tx_members_roles(&balances, transaction)
+        for block in &blockchain.chain {
+            let Ok((next_balances, next_nonces)) =
+                BlockchainValidator::calculate_next_state(&balances, &nonces, block, coinbase)
             else {
                 return false;
             };
-
-            balances.insert(transaction.from, from_balance_new);
-            balances.insert(transaction.to, to_balance_new);
-
-            nonces.insert(transaction.from, next_nonce);
-
-            true
-        }
-
-        for block in &blockchain.chain {
-            for transaction in &block.transactions {
-                if !transaction.is_valid() {
-                    return false;
-                }
-                let success = apply(transaction, &mut balances, coinbase, &mut nonces);
-                if !success {
-                    return false;
-                }
-            }
+            balances = next_balances;
+            nonces = next_nonces;
         }
 
         balances == blockchain.balances && nonces == blockchain.nonces
+    }
+
+    pub fn validate_next_block(
+        blockchain: &Blockchain,
+        block: &Block,
+        coinbase: Address,
+    ) -> Result<(), BlockValidationError> {
+        let last = blockchain
+            .chain
+            .last()
+            .ok_or(BlockValidationError::MissingChainTip)?;
+
+        let expected_index = last
+            .header
+            .index
+            .checked_add(1)
+            .ok_or(BlockValidationError::IndexOverflow)?;
+
+        if block.header.index != expected_index {
+            return Err(BlockValidationError::UnexpectedIndex {
+                expected: expected_index,
+                actual: block.header.index,
+            });
+        }
+
+        if block.header.previous_hash != last.hash {
+            return Err(BlockValidationError::PreviousHashMismatch);
+        }
+
+        let expected_merkle_root = Block::calculate_merkle_root(&block.transactions);
+
+        if block.header.merkle_root != expected_merkle_root {
+            return Err(BlockValidationError::MerkleRootMismatch);
+        }
+
+        let expected_block_hash = Block::calculate_hash(&block.header);
+
+        if block.hash != expected_block_hash {
+            return Err(BlockValidationError::HashMismatch);
+        }
+
+        if block.header.difficulty != blockchain.difficulty {
+            return Err(BlockValidationError::UnexpectedDifficulty {
+                expected: blockchain.difficulty,
+                actual: block.header.difficulty,
+            });
+        }
+
+        if !expected_block_hash.has_leading_zero_hex_digits(block.header.difficulty) {
+            return Err(BlockValidationError::InvalidProofOfWork);
+        }
+
+        let weight = block.weight().ok_or(BlockValidationError::WeightOverflow)?;
+
+        if weight > blockchain.max_block_weight {
+            return Err(BlockValidationError::BlockTooHeavy {
+                weight,
+                max_weight: blockchain.max_block_weight,
+            });
+        }
+
+        let is_valid_coinbase_transaction = BlockchainValidator::check_coinbase_transaction(
+            block,
+            blockchain.mining_reward,
+            coinbase,
+        );
+
+        if !is_valid_coinbase_transaction {
+            return Err(BlockValidationError::InvalidCoinbaseTransaction);
+        }
+
+        Ok(())
     }
 }
