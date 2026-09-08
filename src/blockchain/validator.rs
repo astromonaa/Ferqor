@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::address::{Address, Balances};
 use crate::block::Block;
 use crate::blockchain::Blockchain;
+use crate::blockchain::difficulty::expected_difficulty_for_next_block;
 use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError};
 use crate::blockchain::state_transitions::apply_transaction_to_state;
 
@@ -99,12 +100,13 @@ impl BlockchainValidator {
     }
 
     pub fn validate_next_block(
-        blockchain: &Blockchain,
+        chain: &[Block],
         block: &Block,
         coinbase: Address,
+        max_block_weight: usize,
+        mining_reward: u64,
     ) -> Result<(), BlockValidationError> {
-        let last = blockchain
-            .chain
+        let last = chain
             .last()
             .ok_or(BlockValidationError::MissingChainTip)?;
 
@@ -125,6 +127,13 @@ impl BlockchainValidator {
             return Err(BlockValidationError::PreviousHashMismatch);
         }
 
+        if block.header.timestamp < last.header.timestamp {
+            return Err(BlockValidationError::TimestampBeforePrevious {
+                previous: last.header.timestamp,
+                actual: block.header.timestamp,
+            })
+        }
+
         let expected_merkle_root = Block::calculate_merkle_root(&block.transactions);
 
         if block.header.merkle_root != expected_merkle_root {
@@ -137,9 +146,11 @@ impl BlockchainValidator {
             return Err(BlockValidationError::HashMismatch);
         }
 
-        if block.header.difficulty != blockchain.difficulty {
+        let expected_difficulty = expected_difficulty_for_next_block(chain)?;
+
+        if block.header.difficulty != expected_difficulty {
             return Err(BlockValidationError::UnexpectedDifficulty {
-                expected: blockchain.difficulty,
+                expected: expected_difficulty,
                 actual: block.header.difficulty,
             });
         }
@@ -150,16 +161,16 @@ impl BlockchainValidator {
 
         let weight = block.weight().ok_or(BlockValidationError::WeightOverflow)?;
 
-        if weight > blockchain.max_block_weight {
+        if weight > max_block_weight {
             return Err(BlockValidationError::BlockTooHeavy {
                 weight,
-                max_weight: blockchain.max_block_weight,
+                max_weight: max_block_weight,
             });
         }
 
         let is_valid_coinbase_transaction = BlockchainValidator::check_coinbase_transaction(
             block,
-            blockchain.mining_reward,
+            mining_reward,
             coinbase,
         );
 

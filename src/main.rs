@@ -10,6 +10,7 @@ mod config;
 mod mempool;
 mod transaction;
 mod wallet;
+mod codec;
 
 fn main() -> Result<(), BlockchainError> {
     let alice = Wallet::new();
@@ -18,7 +19,7 @@ fn main() -> Result<(), BlockchainError> {
     let initial_config =
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)?;
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).map_err(BlockchainError::InitializationError)?;
 
     let tx = alice.create_transaction(bob.address, 50, 5, 0);
 

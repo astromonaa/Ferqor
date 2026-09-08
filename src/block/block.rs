@@ -1,6 +1,5 @@
 use crate::{
-    blockchain::utils::{Difficulty, MAX_DIFFICULTY},
-    transaction::{Transaction, TransactionId},
+    block::{encode_block_header, calculate_empty_merkle_root, encode_merkle_node}, blockchain::utils::{Difficulty, MAX_DIFFICULTY}, transaction::Transaction,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -95,10 +94,10 @@ impl Block {
 
     pub fn calculate_merkle_root(transactions: &[Arc<Transaction>]) -> MerkleRoot {
         if transactions.is_empty() {
-            return MerkleRoot([0u8; 32]);
+            return calculate_empty_merkle_root();
         };
 
-        let mut hashes: Vec<TransactionId> = transactions.iter().map(|tx| tx.txid()).collect();
+        let mut hashes: Vec<[u8; 32]> = transactions.iter().map(|tx| tx.txid().0).collect();
 
         while hashes.len() > 1 {
             if hashes.len() % 2 != 0 {
@@ -109,39 +108,20 @@ impl Block {
             hashes = hashes
                 .chunks(2)
                 .map(|pair| {
-                    let mut hasher = Sha256::new();
-
-                    hasher.update(pair[0].as_bytes());
-                    hasher.update(pair[1].as_bytes());
-
-                    let result = hasher.finalize();
-
-                    let mut root = [0u8; 32];
-                    root.copy_from_slice(&result);
-
-                    TransactionId(root)
+                    let payload = encode_merkle_node(&pair[0], &pair[1]);
+                    Sha256::digest(payload).into()
                 })
                 .collect();
         }
 
-        MerkleRoot(hashes[0].0)
+        MerkleRoot(hashes[0])
     }
 
     pub fn calculate_hash(header: &BlockHeader) -> BlockHash {
-        let mut hasher = Sha256::new();
-        hasher.update(header.index.to_be_bytes());
-        hasher.update(header.merkle_root.0);
-        hasher.update(header.previous_hash.0);
-        hasher.update(header.nonce.to_be_bytes());
-        hasher.update(header.timestamp.to_be_bytes());
-        hasher.update(header.difficulty.to_be_bytes());
+        let payload = encode_block_header(header);
 
-        let result = hasher.finalize();
-        let mut root = [0u8; 32];
-
-        root.copy_from_slice(&result);
-
-        BlockHash(root)
+        let hash: [u8; 32] = Sha256::digest(payload).into();
+        BlockHash(hash)
     }
 
     pub fn mine_block(&mut self) {

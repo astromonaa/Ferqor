@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use crate::address::{address_from_public_key, Address};
+use crate::{address::{Address, address_from_public_key}, transaction::hash_transaction_signing_payload};
 use rand_core::OsRng;
 use crate::transaction::Transaction;
 
@@ -29,7 +29,7 @@ impl Wallet {
 
     pub fn create_transaction(&self, to: Address, amount: u64, fee: u64, nonce: u64) -> Transaction {
         let from = self.address;
-        let payload_hash = Transaction::hash_payload(&from, &to, amount, fee, nonce);
+        let payload_hash = hash_transaction_signing_payload(&from, &to, amount, fee, nonce);
 
         let signature = self.sign(&payload_hash);
 

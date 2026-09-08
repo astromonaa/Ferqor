@@ -1,7 +1,8 @@
 use crate::address::{Address, Balances, COINBASE};
 use crate::block::Block;
+use crate::block::block::BlockHash;
+use crate::blockchain::difficulty::expected_difficulty_for_next_block;
 use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError, MiningError};
-use crate::blockchain::utils::Difficulty;
 use crate::blockchain::validator::BlockchainValidator;
 use crate::config::{GenesisConfig, GenesisData};
 use crate::mempool::Mempool;
@@ -11,7 +12,6 @@ use std::sync::Arc;
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
-    pub difficulty: Difficulty,
     pub mempool: Mempool,
     pub balances: Balances,
     pub mining_reward: u64,
@@ -22,7 +22,7 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
-    pub fn new(genesis_data: GenesisData) -> Self {
+    pub fn new(genesis_data: GenesisData) -> Result<Self, BlockValidationError> {
         let mut chain = Vec::new();
         let GenesisData {
             mut genesis_block,
@@ -30,14 +30,23 @@ impl Blockchain {
             max_block_weight,
         } = genesis_data;
 
-        let difficulty = genesis_block.header.difficulty;
+        let expected_mercle_root = Block::calculate_merkle_root(&genesis_block.transactions);
+
+        if genesis_block.header.merkle_root != expected_mercle_root {
+            return Err(BlockValidationError::MerkleRootMismatch);
+        }
+        if genesis_block.header.index != 0 {
+            return Err(BlockValidationError::UnexpectedIndex {
+                expected: 0,
+                actual: genesis_block.header.index,
+            });
+        }
 
         genesis_block.mine_block();
         chain.push(genesis_block);
 
-        Self {
+        Ok(Self {
             chain,
-            difficulty,
             mempool: Mempool::new(),
             balances: initial_balances.clone(),
             mining_reward: 50,
@@ -45,7 +54,7 @@ impl Blockchain {
             nonces: HashMap::new(),
             initial_nonces: HashMap::new(),
             max_block_weight,
-        }
+        })
     }
 
     fn create_block(
@@ -61,13 +70,14 @@ impl Blockchain {
             .checked_add(1)
             .ok_or(BlockValidationError::IndexOverflow)?;
         let now = GenesisConfig::get_now_timestamp();
+        let next_difficulty = expected_difficulty_for_next_block(&self.chain)?;
         let new_block = Block::new(
             index,
             transactions,
             previous_block.hash,
             0,
             now,
-            self.difficulty,
+            next_difficulty,
         );
         Ok(new_block)
     }
@@ -79,8 +89,14 @@ impl Blockchain {
         next_nonces: HashMap<Address, u64>,
     ) -> Result<(), BlockAcceptanceError> {
         /* Проверяем валидность нового блока */
-        BlockchainValidator::validate_next_block(self, &candidate, COINBASE)
-            .map_err(BlockAcceptanceError::Validation)?;
+        BlockchainValidator::validate_next_block(
+            &self.chain,
+            &candidate,
+            COINBASE,
+            self.max_block_weight,
+            self.mining_reward,
+        )
+        .map_err(BlockAcceptanceError::Validation)?;
 
         /* После успешной проверки добавляем блок в цепь */
         self.balances = next_balances;
@@ -221,6 +237,20 @@ impl Blockchain {
             return false;
         };
 
+        if genesis_block.header.index != 0 {
+            return false;
+        }
+
+        let expected_merkle_root = Block::calculate_merkle_root(&genesis_block.transactions);
+
+        if genesis_block.header.merkle_root != expected_merkle_root {
+            return false;
+        }
+
+        if genesis_block.header.previous_hash != BlockHash([0u8; 32]) {
+            return false;
+        }
+
         if !BlockchainValidator::check_block_weight(genesis_block, self.max_block_weight) {
             return false;
         }
@@ -246,44 +276,17 @@ impl Blockchain {
         /* Проверяем вес и транзакции остальных блоков */
         for index in 1..self.chain.len() {
             let current_block = &self.chain[index];
-            let previous_block = &self.chain[index - 1];
+            let previous_chain = &self.chain[..index];
 
-            if !BlockchainValidator::check_block_weight(current_block, self.max_block_weight) {
-                return false;
-            }
-
-            let is_valid_coinbase_transaction = BlockchainValidator::check_coinbase_transaction(
+            if BlockchainValidator::validate_next_block(
+                previous_chain,
                 current_block,
-                self.mining_reward,
                 COINBASE,
-            );
-
-            let calculated_merkle_root = Block::calculate_merkle_root(&current_block.transactions);
-
-            let is_valid_merkle_root = calculated_merkle_root == current_block.header.merkle_root;
-
-            if !is_valid_merkle_root {
-                return false;
-            }
-
-            if current_block.header.difficulty != self.difficulty {
-                return false;
-            }
-
-            let calculated_hash = Block::calculate_hash(&current_block.header);
-
-            let is_valid_hash = calculated_hash == current_block.hash
-                && calculated_hash.has_leading_zero_hex_digits(current_block.header.difficulty);
-
-            if !is_valid_hash {
-                return false;
-            }
-
-            if current_block.header.previous_hash != previous_block.hash {
-                return false;
-            }
-
-            if !is_valid_coinbase_transaction {
+                self.max_block_weight,
+                self.mining_reward,
+            )
+            .is_err()
+            {
                 return false;
             }
         }

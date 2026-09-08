@@ -81,7 +81,16 @@ pub enum BlockValidationError {
         expected: Difficulty,
         actual: Difficulty,
     },
-    
+
+    TimestampBeforePrevious {
+        previous: u64,
+        actual: u64,
+    },
+
+    InsufficientDifficultyHistory {
+        required: usize,
+        actual: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,13 +112,9 @@ pub enum BlockAcceptanceError {
     },
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MiningError {
-    BlockCapacityTooSmall {
-        required: usize,
-        max_weight: usize,
-    },
+    BlockCapacityTooSmall { required: usize, max_weight: usize },
 
     FeeOverflow,
 
@@ -122,4 +127,5 @@ pub enum MiningError {
 pub enum BlockchainError {
     InvalidDifficulty,
     Mining(MiningError),
+    InitializationError(BlockValidationError),
 }

@@ -113,7 +113,7 @@ fn should_accept_first_transaction() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     let tx = alice.create_transaction(bob.address, 50, 5, 0);
 
@@ -147,7 +147,7 @@ fn should_accept_transaction_with_valid_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -172,7 +172,7 @@ fn should_accept_transaction_while_there_are_pending_transactions() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -201,7 +201,7 @@ fn should_not_accept_transaction_with_skipped_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -238,7 +238,7 @@ fn should_not_accept_if_nonce_overflows() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     blockchain.nonces.insert(alice.address, u64::MAX);
 
@@ -273,7 +273,7 @@ fn should_accept_last_tx_with_u64_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
     blockchain.nonces.insert(alice.address, u64::MAX - 1);
 
     let tx = alice.create_transaction(bob.address, 10, 1, u64::MAX - 1);
@@ -296,7 +296,7 @@ fn should_not_accept_transaction_with_stale_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 200)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config);
+    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
 
     blockchain.nonces.insert(alice.address, 7);
 
