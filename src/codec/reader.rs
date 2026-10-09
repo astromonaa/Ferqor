@@ -107,6 +107,7 @@ macro_rules! impl_canonical_decode {
 }
 
 impl_canonical_decode!(u8, 1);
+impl_canonical_decode!(u16, 2);
 impl_canonical_decode!(u32, 4);
 impl_canonical_decode!(u64, 8);
 

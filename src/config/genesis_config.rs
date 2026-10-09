@@ -3,7 +3,7 @@ use crate::block::Block;
 use crate::block::block::BlockHash;
 use crate::blockchain::error::BlockchainError;
 use crate::blockchain::utils::{Difficulty, MAX_DIFFICULTY};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use std::collections::HashMap;
 
 pub struct GenesisConfig {}
@@ -19,6 +19,14 @@ const MAX_BLOCK_WEIGHT: usize = 1000;
 impl GenesisConfig {
     pub fn get_now_timestamp() -> u64 {
         Utc::now().timestamp() as u64
+    }
+
+    fn get_genesis_timestamp() -> Result<u64, BlockchainError> {
+        match Utc.with_ymd_and_hms(2026, 01, 01, 12, 0, 0) {
+            chrono::offset::LocalResult::Single(value) => Ok(value.timestamp() as u64),
+            chrono::offset::LocalResult::Ambiguous(_, value) => Ok(value.timestamp() as u64),
+            chrono::offset::LocalResult::None => Err(BlockchainError::GenesisDateTime),
+        }
     }
 
     pub fn initial_balances(balances: Option<Balances>) -> Balances {
@@ -43,8 +51,8 @@ impl GenesisConfig {
             return Err(BlockchainError::InvalidDifficulty);
         }
 
-        let now = GenesisConfig::get_now_timestamp();
-        let genesis_block = Block::new(0, vec![], BlockHash([0u8; 32]), 0, now, difficulty);
+        let datetime = GenesisConfig::get_genesis_timestamp()?;
+        let genesis_block = Block::new(0, vec![], BlockHash([0u8; 32]), 0, datetime, difficulty);
         let initial_balances = GenesisConfig::initial_balances(balances);
 
         Ok(GenesisData {

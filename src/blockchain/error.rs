@@ -128,4 +128,5 @@ pub enum BlockchainError {
     InvalidDifficulty,
     Mining(MiningError),
     InitializationError(BlockValidationError),
+    GenesisDateTime
 }

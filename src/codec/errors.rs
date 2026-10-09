@@ -33,5 +33,8 @@ pub enum DecodingError {
         transaction_index: usize,
         actual: usize,
         max: usize,
+    },
+    UnknownMessageType {
+        actual: u8,
     }
 }

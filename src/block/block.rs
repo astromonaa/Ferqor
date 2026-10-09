@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub struct MerkleRoot(pub [u8; 32]);
 
+#[derive(Debug, Clone)]
 pub struct BlockHeader {
     pub index: u64,
     pub previous_hash: BlockHash,
@@ -57,6 +58,7 @@ impl BlockHash {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Arc<Transaction>>,

@@ -11,6 +11,9 @@ mod mempool;
 mod transaction;
 mod wallet;
 mod codec;
+mod network;
+mod app;
+mod runtime;
 
 fn main() -> Result<(), BlockchainError> {
     let alice = Wallet::new();

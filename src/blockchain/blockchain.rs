@@ -30,9 +30,9 @@ impl Blockchain {
             max_block_weight,
         } = genesis_data;
 
-        let expected_mercle_root = Block::calculate_merkle_root(&genesis_block.transactions);
+        let expected_merkle_root = Block::calculate_merkle_root(&genesis_block.transactions);
 
-        if genesis_block.header.merkle_root != expected_mercle_root {
+        if genesis_block.header.merkle_root != expected_merkle_root {
             return Err(BlockValidationError::MerkleRootMismatch);
         }
         if genesis_block.header.index != 0 {
@@ -82,27 +82,33 @@ impl Blockchain {
         Ok(new_block)
     }
 
-    fn accept_block(
-        &mut self,
-        candidate: Block,
-        next_balances: Balances,
-        next_nonces: HashMap<Address, u64>,
-    ) -> Result<(), BlockAcceptanceError> {
+    fn validate_candidate(&self, candidate: &Block) -> Result<(), BlockAcceptanceError> {
         /* Проверяем валидность нового блока */
         BlockchainValidator::validate_next_block(
             &self.chain,
-            &candidate,
+            candidate,
             COINBASE,
             self.max_block_weight,
             self.mining_reward,
         )
-        .map_err(BlockAcceptanceError::Validation)?;
+        .map_err(BlockAcceptanceError::Validation)
+    }
+
+    fn commit_block(
+        &mut self,
+        candidate: Block,
+        next_balances: Balances,
+        next_nonces: HashMap<Address, u64>,
+    ) {
+        /* Удаляем транзакции из mempool  */
+        for tx in candidate.transactions.iter().skip(1) {
+            self.mempool.remove(&tx.txid());
+        }
 
         /* После успешной проверки добавляем блок в цепь */
         self.balances = next_balances;
         self.nonces = next_nonces;
         self.chain.push(candidate);
-        Ok(())
     }
 
     pub fn add_block(
@@ -112,7 +118,8 @@ impl Blockchain {
         let mut candidate = self
             .create_block(transactions)
             .map_err(BlockAcceptanceError::Validation)?;
-        /* Сперва проверям возможное применение нового блока */
+
+        /* Вычисляем новое состояние после применения блока */
         let (next_balances, next_nonces) = BlockchainValidator::calculate_next_state(
             &self.balances,
             &self.nonces,
@@ -123,8 +130,31 @@ impl Blockchain {
         /* После успешной проверки майним блок */
         candidate.mine_block();
 
-        /* После успешного майнинга добавляем блок в цепь */
-        self.accept_block(candidate, next_balances, next_nonces)
+        /* Проверяем валидность нового блока */
+        self.validate_candidate(&candidate)?;
+
+        /* После успешной проверки добавляем блок в цепь */
+        self.commit_block(candidate, next_balances, next_nonces);
+
+        Ok(())
+    }
+
+    pub fn receive_block(&mut self, candidate: Block) -> Result<(), BlockAcceptanceError> {
+        /* Проверяем валидность полученного блока */
+        self.validate_candidate(&candidate)?;
+
+        /* Вычисляем новое состояние после применения блока */
+        let (next_balances, next_nonces) = BlockchainValidator::calculate_next_state(
+            &self.balances,
+            &self.nonces,
+            &candidate,
+            COINBASE,
+        )?;
+
+        /* После успешной проверки добавляем блок в цепь */
+        self.commit_block(candidate, next_balances, next_nonces);
+
+        Ok(())
     }
 
     pub fn add_transaction(&mut self, transaction: Transaction) -> bool {
@@ -224,9 +254,6 @@ impl Blockchain {
 
         self.add_block(transactions)
             .map_err(MiningError::BlockAcceptance)?;
-
-        self.mempool
-            .remove_selected_transactions(&pending_transactions);
 
         Ok(())
     }
