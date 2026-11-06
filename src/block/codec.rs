@@ -1,12 +1,17 @@
-use sha2::{Digest, Sha256};
+//! Wire-кодек блоков и domain-декодеры.
+//!
+//! Реализации `CanonicalDecode` перенесены из `codec::reader`, а публичные функции
+//! кодирования сохранены на прежнем пути `block::codec`.
+
 use std::{convert::TryFrom, sync::Arc};
 
 use crate::{
     block::{
         Block, EncodingError,
-        block::{BlockHeader, MerkleRoot},
+        block::{BlockHash, BlockHeader, MerkleRoot},
+        commitment,
     },
-    codec::{ByteReader, DecodingError},
+    codec::{ByteReader, CanonicalDecode, DecodingError},
     transaction::{Transaction, decode_transaction, encode_transaction},
 };
 
@@ -18,37 +23,15 @@ pub struct BlockDecodeLimits {
 }
 
 pub fn encode_block_header(header: &BlockHeader) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(104);
-
-    payload.extend_from_slice(b"BLOCK_HEADER_V1");
-    payload.extend_from_slice(&header.index.to_be_bytes());
-    payload.extend_from_slice(&header.previous_hash.0);
-    payload.extend_from_slice(&header.timestamp.to_be_bytes());
-    payload.extend_from_slice(&header.merkle_root.0);
-    payload.extend_from_slice(&header.difficulty.to_be_bytes());
-    payload.extend_from_slice(&header.nonce.to_be_bytes());
-
-    payload
+    commitment::encode_block_header(header)
 }
 
 pub fn encode_merkle_node(pair1: &[u8; 32], pair2: &[u8; 32]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(78);
-
-    payload.extend_from_slice(b"MERKLE_NODE_V1");
-    payload.extend_from_slice(pair1);
-    payload.extend_from_slice(pair2);
-
-    payload
+    commitment::encode_merkle_node(pair1, pair2)
 }
 
 pub fn calculate_empty_merkle_root() -> MerkleRoot {
-    let mut payload = Vec::with_capacity(15);
-
-    payload.extend_from_slice(b"MERKLE_EMPTY_V1");
-
-    let hash: [u8; 32] = Sha256::digest(&payload).into();
-
-    MerkleRoot(hash)
+    commitment::calculate_empty_merkle_root()
 }
 
 pub fn encode_block(block: &Block) -> Result<Vec<u8>, EncodingError> {
@@ -113,7 +96,7 @@ pub fn decode_block(bytes: &[u8], limits: &BlockDecodeLimits) -> Result<Block, D
                 max: limits.max_tx_bytes,
             });
         }
-        
+
         let tx_bytes = reader.read_slice(tx_len)?;
 
         let tx = decode_transaction(tx_bytes)?;
@@ -127,4 +110,42 @@ pub fn decode_block(bytes: &[u8], limits: &BlockDecodeLimits) -> Result<Block, D
         header,
         transactions,
     })
+}
+
+/// Декодирование перенесено из прежнего `codec::reader` без изменения формата.
+impl CanonicalDecode for BlockHash {
+    fn decode(reader: &mut ByteReader<'_>) -> Result<Self, DecodingError> {
+        let bytes = reader.read_exact::<32>()?;
+        Ok(BlockHash(bytes))
+    }
+}
+
+/// Декодирование перенесено из прежнего `codec::reader` без изменения формата.
+impl CanonicalDecode for MerkleRoot {
+    fn decode(reader: &mut ByteReader<'_>) -> Result<Self, DecodingError> {
+        let bytes = reader.read_exact::<32>()?;
+        Ok(MerkleRoot(bytes))
+    }
+}
+
+/// Декодирование перенесено из прежнего `codec::reader` без изменения порядка полей.
+impl CanonicalDecode for BlockHeader {
+    fn decode(reader: &mut ByteReader<'_>) -> Result<Self, DecodingError> {
+        reader.expect_tag(b"BLOCK_HEADER_V1")?;
+        let index = reader.read::<u64>()?;
+        let previous_hash = reader.read::<BlockHash>()?;
+        let timestamp = reader.read::<u64>()?;
+        let merkle_root = reader.read::<MerkleRoot>()?;
+        let difficulty = reader.read::<u8>()?;
+        let nonce = reader.read::<u64>()?;
+
+        Ok(BlockHeader {
+            index,
+            previous_hash,
+            nonce,
+            timestamp,
+            merkle_root,
+            difficulty,
+        })
+    }
 }

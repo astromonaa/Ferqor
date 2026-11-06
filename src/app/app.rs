@@ -3,86 +3,94 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    app::types::AppError,
-    block::Block,
-    blockchain::Blockchain,
-    network::types::{InboundMessage, NetworkMessage, NodeCommand},
-    transaction::{Transaction},
+    app::types::{AppCommand, AppError, InboundMessage, NodeCommand},
+    network::wire::NetworkMessage,
 };
 
 pub struct App {
-    blockchain: Blockchain,
-    app_to_node_sender: Sender<NodeCommand>,
+    pub app_to_node_sender: Sender<NodeCommand>,
     node_to_app_receiver: Receiver<InboundMessage>,
+    main_to_app_receiver: Receiver<AppCommand>,
+    pub service_to_app_receiver: Receiver<(NetworkMessage, Option<SocketAddr>)>,
+    pub app_to_service_sender: Sender<AppCommand>,
 }
 
 impl App {
     pub fn new(
-        blockchain: Blockchain,
         app_to_node_sender: Sender<NodeCommand>,
         node_to_app_receiver: Receiver<InboundMessage>,
+        main_to_app_receiver: Receiver<AppCommand>,
+        service_to_app_receiver: Receiver<(NetworkMessage, Option<SocketAddr>)>,
+        app_to_service_sender: Sender<AppCommand>,
     ) -> Self {
         Self {
-            blockchain,
             app_to_node_sender,
             node_to_app_receiver,
+            main_to_app_receiver,
+            service_to_app_receiver,
+            app_to_service_sender,
         }
     }
 
     pub async fn run(mut self) -> Result<(), AppError> {
-        while let Some(message) = self.node_to_app_receiver.recv().await {
-            match message.message {
-                NetworkMessage::Block(block) => {
-                    match self.blockchain.receive_block(block.clone()) {
-                        Ok(_) => {
-                            println!("Succesfully added new block");
-                            self.handle_block_accept(message.source, block).await?
-                        }
-                        Err(e) => println!("Error while adding block to blockchain: {:?}", e),
-                    }
+        loop {
+            tokio::select! {
+                received_from_node = self.node_to_app_receiver.recv() => {
+                    let Some(message) = received_from_node else {
+                        return Ok(());
+                    };
+                    self.handle_node_message(message).await?;
                 }
-                NetworkMessage::Transaction(transaction) => {
-                    if self.blockchain.add_transaction(transaction.clone()) {
-                        println!("Succesfully added new transaction");
-                        self.handle_transaction_accept(message.source, transaction)
-                            .await?
-                    }
-                },
-                NetworkMessage::Handshake(_) => {
-                    
+
+                Some(command_from_main) = self.main_to_app_receiver.recv() => {
+                    self.app_to_service_sender.send(command_from_main).await?;
                 }
+                Some((message, source)) = self.service_to_app_receiver.recv() => self.handle_service_message(message, source).await?
             }
+        }
+    }
+
+    async fn handle_node_message(&mut self, message: InboundMessage) -> Result<(), AppError> {
+        let source = Some(message.source);
+        match message.message {
+            NetworkMessage::Block(block) => match self
+                .app_to_service_sender
+                .send(AppCommand::SubmitBlock(block.clone(), source))
+                .await
+            {
+                Ok(_) => {
+                    println!("Succesfully send new block to blockchain service");
+                }
+                Err(e) => println!("Error while sending block to blockchain service: {:?}", e),
+            },
+            NetworkMessage::Transaction(transaction) => match self
+                .app_to_service_sender
+                .send(AppCommand::SubmitTransaction(transaction.clone(), source))
+                .await
+            {
+                Ok(_) => {
+                    println!("Succesfully send new transaction to blockchain service");
+                }
+                Err(e) => println!("Error while sending transaction to blockchain service {:?}", e),
+            },
+            NetworkMessage::Handshake(_) => {}
         }
 
         Ok(())
     }
 
-    async fn handle_block_accept(
+    async fn handle_service_message(
         &self,
-        source: SocketAddr,
-        block: Block,
+        message: NetworkMessage,
+        source: Option<SocketAddr>,
     ) -> Result<(), AppError> {
-        let response_command = NodeCommand::BroadcastExcept(source, NetworkMessage::Block(block));
-        self.app_to_node_sender
-            .send(response_command)
-            .await
-            .map_err(AppError::BroadcastBlockError)?;
+        let node_command = if let Some(s) = source {
+            NodeCommand::BroadcastExcept(s, message)
+        } else {
+            NodeCommand::Broadcast(message)
+        };
 
-        Ok(())
-    }
-
-    async fn handle_transaction_accept(
-        &self,
-        source: SocketAddr,
-        transaction: Transaction,
-    ) -> Result<(), AppError> {
-        let response_command =
-            NodeCommand::BroadcastExcept(source, NetworkMessage::Transaction(transaction));
-
-        self.app_to_node_sender
-            .send(response_command)
-            .await
-            .map_err(AppError::BroadcastTransactionError)?;
+        self.app_to_node_sender.send(node_command).await?;
         Ok(())
     }
 }

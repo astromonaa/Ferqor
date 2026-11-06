@@ -5,17 +5,17 @@ use tokio::{
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    time::error::Elapsed,
+    }
 };
 
-use crate::network::{codec::encode_network_message, types::PeerEvent};
 use crate::network::{
-    codec::{NetworkDecodeLimits, decode_network_message},
+    codec::{NetworkDecodeLimits, decode_network_frame, encode_network_message},
+    error::PeerError,
+    peer::types::{ConnectionId, PeerEvent},
+    protocol::Handshake,
     transport::TransportClient,
-    types::{NetworkMessage, PeerError},
+    wire::NetworkMessage,
 };
-use crate::network::{node::types::ConnectionId, types::Handshake};
 
 #[derive(Debug)]
 pub struct Peer {
@@ -98,9 +98,9 @@ impl Peer {
         connection_id: ConnectionId,
     ) -> Result<(), PeerError> {
         loop {
-            match TransportClient::read_frame(reader, &limits).await {
-                Ok(bytes) => {
-                    let message: NetworkMessage = decode_network_message(&bytes, &limits)?;
+            match TransportClient::read_network_frame(reader, &limits).await {
+                Ok(frame) => {
+                    let message: NetworkMessage = decode_network_frame(&frame, &limits)?;
                     sender_to_node
                         .send(PeerEvent::Message(addr, message, connection_id))
                         .await

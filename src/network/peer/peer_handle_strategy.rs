@@ -1,9 +1,14 @@
 use std::net::SocketAddr;
 
-use tokio::{sync::mpsc::Sender, time::Instant};
+use tokio::{
+    sync::mpsc::{Sender, error::TrySendError},
+    time::Instant,
+};
 
-use crate::network::{
-    node::types::{PeerAction, PeerHandle, PeerState}, types::{Handshake, HandshakeError, InboundMessage, NetworkMessage, PeerError},
+use crate::{
+    app::types::InboundMessage, network::{
+        error::PeerError, peer::types::{PeerAction, PeerDisconnectReason, PeerHandle, PeerState}, protocol::{Handshake, validate_handshake}, wire::NetworkMessage,
+    },
 };
 
 pub trait PeerStrategy {
@@ -14,7 +19,7 @@ pub trait PeerStrategy {
         sender: &mut PeerHandle,
     ) -> Result<PeerAction, PeerError>;
 
-    async fn on_message_receive(
+    fn on_message_receive(
         &self,
         network_message: NetworkMessage,
         node_to_app_sender: &Sender<InboundMessage>,
@@ -32,59 +37,45 @@ impl PeerStrategy for PeerState {
         match self {
             PeerState::AwaitingHandshake { deadline } => {
                 if Instant::now() >= *deadline {
-                    return Ok(PeerAction::Disconnect)
+                    return Ok(PeerAction::Disconnect(PeerDisconnectReason::ConnectionClosed));
                 }
                 match validate_handshake(&local_handshake, &remote_handshake) {
                     Ok(_) => {
                         /* Если handshake прошел валидацию, то помечаем текущее соединение активным */
                         sender.activate(remote_handshake);
                     }
+                    /* Несовместимая сеть, версия или соединение с собой */
                     Err(e) => {
                         println!("Error while validating handshake: {e:?}");
-                        return Ok(PeerAction::Disconnect)
+                        return Ok(PeerAction::Disconnect(PeerDisconnectReason::InvalidProtocol));
                     }
                 }
 
                 Ok(PeerAction::Continue)
             }
-            PeerState::Active(_) => Ok(PeerAction::Disconnect),
+            PeerState::Active(_) => Ok(PeerAction::Disconnect(PeerDisconnectReason::InvalidProtocol)),
         }
     }
 
-    async fn on_message_receive(
+    fn on_message_receive(
         &self,
         network_message: NetworkMessage,
         node_to_app_sender: &Sender<InboundMessage>,
         addr: SocketAddr,
     ) -> Result<PeerAction, PeerError> {
         match self {
-            PeerState::AwaitingHandshake { .. } => Ok(PeerAction::Disconnect),
+            PeerState::AwaitingHandshake { .. } => Ok(PeerAction::Disconnect(PeerDisconnectReason::InvalidProtocol)),
             PeerState::Active(_) => {
                 let message_to_app = InboundMessage::new(addr, network_message);
-                node_to_app_sender
-                    .send(message_to_app)
-                    .await
-                    .map_err(PeerError::SendToAppChannelError)?;
-                Ok(PeerAction::Continue)
+                match node_to_app_sender.try_send(message_to_app) {
+                    Ok(()) => Ok(PeerAction::Continue),
+                    Err(TrySendError::Full(_)) => {
+                        eprintln!("App queue is full; disconnecting peer {addr}");
+                        Ok(PeerAction::Disconnect(PeerDisconnectReason::ConnectionClosed))
+                    }
+                    Err(TrySendError::Closed(_)) => Err(PeerError::AppChannelClosed),
+                }
             }
         }
     }
-}
-
-pub fn validate_handshake(local: &Handshake, remote: &Handshake) -> Result<(), HandshakeError> {
-    if local.protocol_version != remote.protocol_version {
-        return Err(HandshakeError::ProtocolVersionMismatch(
-            remote.protocol_version,
-        ));
-    }
-
-    if local.network_id != remote.network_id {
-        return Err(HandshakeError::NetworkIdMismatch(remote.network_id));
-    }
-
-    if local.node_id == remote.node_id {
-        return Err(HandshakeError::SelfConnection(remote.node_id));
-    }
-
-    Ok(())
 }

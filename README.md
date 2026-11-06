@@ -28,11 +28,22 @@ Ferqor — блокчейн на Rust, находящийся на этапе а
 ```bash
 git clone https://github.com/astromonaa/Ferqor.git
 cd Ferqor
+cp .env.example .env.local
 cargo build --release
-cargo run --release
+cargo run --release -- --env-file=.env.local
 ```
 
-Текущий `main` запускает локальный сценарий создания транзакции и майнинга блока. Модули `network`, `app` и `runtime` уже реализуют основу сетевого узла, но пока не подключены к CLI как основной режим запуска.
+`main` загружает runtime-конфигурацию из указанного env-файла и совместно запускает TCP Node, Application и BlockchainService. Локальные `.env`-файлы игнорируются Git; для новой конфигурации используйте `.env.example` как шаблон.
+
+### Runtime-конфигурация
+
+- `LISTEN_ADDR` — локальный адрес TCP listener, по умолчанию `0.0.0.0:9000`;
+- `ADVERTIZE_ADDR` — публичный адрес узла, отправляемый в handshake;
+- `NODE_ID` — обязательный уникальный идентификатор из 32 байт в hex-представлении;
+- `CONNECT` — необязательный список адресов peer через запятую;
+- `INITIAL_SENDER` — включает локальный demo-сценарий: после запуска отправляется транзакция и команда майнинга.
+
+Для двух локальных узлов создайте два env-файла с разными `LISTEN_ADDR`, `ADVERTIZE_ADDR` и `NODE_ID`. У второго узла укажите адрес первого в `CONNECT`. Не используйте демонстрационные ключи и идентификаторы в публичной сети.
 
 ## Пример использования блокчейна
 
@@ -62,9 +73,17 @@ fn main() {
 
     assert!(blockchain.add_transaction(transaction));
 
-    blockchain
+    let Some((mut candidate, next_ledger)) = blockchain
         .mine_pending_transactions(alice.address)
-        .expect("block mining should succeed");
+        .expect("candidate creation should succeed")
+    else {
+        return;
+    };
+
+    candidate.mine_block();
+    blockchain
+        .add_block(candidate, next_ledger)
+        .expect("mined block should be accepted");
 
     assert!(blockchain.is_valid());
 }
@@ -72,25 +91,27 @@ fn main() {
 
 ## Архитектура
 
-### Blockchain
+### Blockchain, Chain и Ledger
 
-`src/blockchain/` содержит основную логику цепочки:
+`Blockchain` в `src/blockchain/` — публичный фасад, координирующий каноническую цепочку, mempool и создание блоков-кандидатов.
 
-- создание, майнинг, получение и атомарное применение блоков;
-- расчёт следующего состояния балансов и nonce;
-- типизированные ошибки валидации и переходов состояния;
-- перерасчёт сложности и оценку накопленной работы;
-- полную проверку цепочки.
+`src/chain/` владеет блоками, текущим и начальным состоянием, параметрами консенсуса и валидацией цепочки. Основа реестра индексированных блоков уже выделена, но полноценный fork choice и reorg ещё не завершены.
 
-Внешний блок сначала валидируется и применяется к копии состояния. Только после успешных проверок новое состояние и блок фиксируются в цепочке.
+`src/ledger/` отвечает только за balances, nonce и атомарные переходы состояния. Транзакции блока применяются к копии `LedgerState`; текущее состояние заменяется лишь при успешном commit блока.
+
+### Consensus и Mining
+
+`src/consensus/` содержит неизменяемые параметры консенсуса, перерасчёт сложности и оценку накопленной работы. Создание и валидация блоков используют один набор `ConsensusParams`.
+
+`src/mining/` создаёт блоки-кандидаты и coinbase-транзакции. Proof-of-Work выполняется исходным `Block::mine_block` вне владельца состояния, после чего добытый кандидат возвращается в `BlockchainService` для валидации и commit.
 
 ### Block и Transaction
 
-`src/block/` и `src/transaction/` определяют структуры данных и их канонические кодеки. Хеши вычисляются по domain-separated payload, чтобы разные сущности протокола не использовали неоднозначное представление байтов.
+`src/block/` и `src/transaction/` определяют структуры данных и их канонические кодеки. Consensus-critical commitment вынесены в отдельные внутренние модули, чтобы txid, подписи, Merkle root и block hash использовали единое domain-separated представление байтов.
 
 ### Mempool
 
-`src/mempool/` хранит транзакции по ID и индексирует их по отправителю и nonce. При формировании блока выбираются только последовательные транзакции, а суммарный вес не превышает настроенный лимит.
+`src/mempool/` хранит транзакции по ID и индексирует их по отправителю и nonce. При формировании блока выбираются только последовательные транзакции, а суммарный вес не превышает лимит после резервирования места под coinbase.
 
 ### Network
 
@@ -101,14 +122,16 @@ fn main() {
 - лимиты декодирования для защиты от чрезмерных payload;
 - handshake с проверкой версии протокола, network ID и self-connection;
 - отдельные reader/writer loops для каждого peer;
-- реестр peer-соединений, connection ID и timeout ожидания handshake;
+- реестр peer-соединений, connection ID, лимиты подключений и повторные попытки соединения;
 - команды `SendTo`, `Broadcast`, `BroadcastExcept`, `Disconnect` и `Shutdown`.
 
-### App и Runtime
+### App, BlockchainService и Runtime
 
-`src/app/` принимает проверенные сетевые события, передаёт транзакции и блоки в blockchain и распространяет успешно принятые данные другим peer.
+`App` маршрутизирует сообщения между Node, локальными командами и `BlockchainService`. Принятые транзакции и блоки передаются сервису, а успешно обработанные данные отправляются обратно в Node для broadcast.
 
-`src/runtime/` связывает `Node` и `App` двунаправленными Tokio channels и запускает их конкурентно.
+`BlockchainService` является единственным владельцем изменяемого `Blockchain`. Подготовленный блок-кандидат добывается в отдельном потоке, затем возвращается сервису и фиксируется после валидации.
+
+`src/runtime/` создаёт Tokio channels и конкурентно запускает `Node`, `App` и `BlockchainService`.
 
 ## Сетевой формат
 
@@ -132,17 +155,22 @@ fn main() {
 ```text
 src/
 ├── address/       # Адреса и балансы
-├── app/           # Приём сетевых событий и команды Node
-├── block/         # Блоки, Merkle tree и кодек блоков
-├── blockchain/    # Цепочка, валидация, состояние и сложность
+├── app/           # App, команды и владелец BlockchainService
+├── block/         # Блоки, Merkle tree, commitment и кодек
+├── blockchain/    # Публичный фасад Blockchain и ошибки
+├── chain/         # Каноническая цепочка, индекс и валидация
 ├── codec/         # Безопасный ByteReader и ошибки декодирования
-├── config/        # Конфигурация genesis-блока
+├── config/        # Genesis, runtime-конфигурация и сетевые лимиты
+├── consensus/     # Параметры, сложность и накопленная работа
+├── ledger/        # Балансы, nonce и переходы состояния
 ├── mempool/       # Очередь неподтверждённых транзакций
-├── network/       # TCP transport, protocol codec, Node и Peer
-├── runtime/       # Совместный запуск App и Node
-├── transaction/   # Транзакции и их канонический кодек
+├── mining/        # Создание кандидатов и coinbase
+├── network/       # TCP transport, wire protocol, Node и Peer
+├── runtime/       # Совместный запуск Node, App и BlockchainService
+├── transaction/   # Транзакции, commitment и канонический кодек
+├── utils/         # Локальные команды demo-сценария
 ├── wallet/        # Ed25519-кошелёк
-└── main.rs        # Текущий локальный пример запуска
+└── main.rs        # Загрузка конфигурации и запуск runtime
 ```
 
 ## Тесты
@@ -151,12 +179,12 @@ src/
 cargo test
 ```
 
-Текущий набор покрывает подписи транзакций, nonce, pending cost, переполнения и базовую работу blockchain/mempool. Покрытие сетевого протокола и многонодовых сценариев ещё предстоит расширить.
+Текущий набор покрывает подписи и канонические commitment транзакций, блоковые кодеки и Merkle root, nonce, pending cost, переполнения, переходы состояния, mining pipeline, сетевой wire-формат, handshake и границы TCP frame. Полноценные многонодовые и reconnect-сценарии пока требуют интеграционных тестов.
 
 ## Текущие ограничения и roadmap
 
-- Сетевой runtime пока не подключён к CLI по умолчанию.
-- Нет загрузки истории блоков, fork choice и автоматической синхронизации отстающего узла.
+- Runtime запускается через обязательный `--env-file`; отдельный пользовательский CLI пока отсутствует.
+- Нет загрузки истории блоков, завершённого fork choice и автоматической синхронизации отстающего узла.
 - Нет персистентного хранилища: chain, state и mempool находятся в памяти.
 - Требуются дополнительные интеграционные тесты TCP framing, handshake, reconnect и распространения блоков.
 - Не реализованы discovery, шифрование transport-соединений и защита от всех классов сетевых атак.
@@ -167,9 +195,10 @@ cargo test
 - `tokio` — асинхронный runtime, TCP и channels;
 - `sha2` — SHA-256;
 - `ed25519-dalek` — подпись и проверка транзакций;
-- `rand_core` — генерация ключей;
+- `rand_core` и `rand` — генерация ключей и случайных значений;
 - `chrono` — timestamps;
 - `num-bigint` — расчёт накопленной работы;
+- `dotenv` — загрузка runtime-конфигурации узла;
 - `hex` — hex-представление данных.
 
 ## Contributing

@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+//! Валидация блоков, перенесённая из `blockchain::validator` к владельцу `chain`.
 
-use crate::address::{Address, Balances};
+use crate::address::Address;
 use crate::block::Block;
-use crate::blockchain::Blockchain;
-use crate::blockchain::difficulty::expected_difficulty_for_next_block;
-use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError};
-use crate::blockchain::state_transitions::apply_transaction_to_state;
+use crate::blockchain::error::BlockValidationError;
+use crate::chain::Chain;
+use crate::consensus::{ConsensusParams, expected_difficulty_for_next_block};
 
+/// Валидатор без состояния, перенесённый из `blockchain::validator::BlockchainValidator`.
 pub struct BlockchainValidator;
 
 impl BlockchainValidator {
+    /// Сохраняет `blockchain::validator::BlockchainValidator::check_block_weight`.
     pub fn check_block_weight(block: &Block, max_block_weight: usize) -> bool {
         matches!(
             block.weight(),
@@ -17,6 +18,8 @@ impl BlockchainValidator {
         )
     }
 
+    /// Сохраняет
+    /// `blockchain::validator::BlockchainValidator::check_coinbase_transaction`.
     pub fn check_coinbase_transaction(
         current_block: &Block,
         mining_reward: u64,
@@ -35,7 +38,7 @@ impl BlockchainValidator {
             return false;
         }
 
-        /* Делаем skip(1), чтобы пропустить первый Coinbase транзакцию, т.к. Coinbase не платит fee */
+        /* Как в прежнем `BlockchainValidator::check_coinbase_transaction`, пропускаем первую наградную транзакцию: она не платит комиссию. */
         let Some(total_fees) = current_block
             .transactions
             .iter()
@@ -62,53 +65,30 @@ impl BlockchainValidator {
         coinbase_transactions == 1
     }
 
-    pub fn calculate_next_state(
-        balances: &Balances,
-        nonces: &HashMap<Address, u64>,
-        block: &Block,
-        coinbase: Address,
-    ) -> Result<(Balances, HashMap<Address, u64>), BlockAcceptanceError> {
-        let mut next_balances = balances.clone();
-        let mut next_nonces = nonces.clone();
+    /// Сохраняет `BlockchainValidator::validate_state_transitions`, теперь повторно
+    /// вычисляя состояние через аксессоры `Chain`, а не через поля `Blockchain`.
+    pub fn validate_state_transitions(chain: &Chain, coinbase: Address) -> bool {
+        let mut ledger = chain.initial_ledger().clone();
 
-        for (transaction_index, transaction) in block.transactions.iter().enumerate() {
-            apply_transaction_to_state(transaction, &mut next_balances, &mut next_nonces, coinbase)
-                .map_err(|source| BlockAcceptanceError::StateTransition {
-                    transaction_index,
-                    source,
-                })?
-        }
-
-        Ok((next_balances, next_nonces))
-    }
-
-    pub fn validate_state_transitions(blockchain: &Blockchain, coinbase: Address) -> bool {
-        let mut balances = blockchain.initial_balances.clone();
-        let mut nonces = blockchain.initial_nonces.clone();
-
-        for block in &blockchain.chain {
-            let Ok((next_balances, next_nonces)) =
-                BlockchainValidator::calculate_next_state(&balances, &nonces, block, coinbase)
-            else {
+        for block in chain.blocks() {
+            let Ok(next_ledger) = ledger.apply_block(block, coinbase) else {
                 return false;
             };
-            balances = next_balances;
-            nonces = next_nonces;
+            ledger = next_ledger;
         }
 
-        balances == blockchain.balances && nonces == blockchain.nonces
+        &ledger == chain.ledger()
     }
 
+    /// Валидирует следующий блок реализацией, перенесённой из
+    /// `blockchain::validator::BlockchainValidator::validate_next_block`.
     pub fn validate_next_block(
         chain: &[Block],
         block: &Block,
         coinbase: Address,
-        max_block_weight: usize,
-        mining_reward: u64,
+        params: &ConsensusParams,
     ) -> Result<(), BlockValidationError> {
-        let last = chain
-            .last()
-            .ok_or(BlockValidationError::MissingChainTip)?;
+        let last = chain.last().ok_or(BlockValidationError::MissingChainTip)?;
 
         let expected_index = last
             .header
@@ -131,7 +111,7 @@ impl BlockchainValidator {
             return Err(BlockValidationError::TimestampBeforePrevious {
                 previous: last.header.timestamp,
                 actual: block.header.timestamp,
-            })
+            });
         }
 
         let expected_merkle_root = Block::calculate_merkle_root(&block.transactions);
@@ -140,13 +120,13 @@ impl BlockchainValidator {
             return Err(BlockValidationError::MerkleRootMismatch);
         }
 
-        let expected_block_hash = Block::calculate_hash(&block.header);
+        let calculated_block_hash = Block::calculate_hash(&block.header);
 
-        if block.hash != expected_block_hash {
+        if block.hash != calculated_block_hash {
             return Err(BlockValidationError::HashMismatch);
         }
 
-        let expected_difficulty = expected_difficulty_for_next_block(chain)?;
+        let expected_difficulty = expected_difficulty_for_next_block(chain, params)?;
 
         if block.header.difficulty != expected_difficulty {
             return Err(BlockValidationError::UnexpectedDifficulty {
@@ -155,22 +135,22 @@ impl BlockchainValidator {
             });
         }
 
-        if !expected_block_hash.has_leading_zero_hex_digits(block.header.difficulty) {
+        if !calculated_block_hash.has_leading_zero_hex_digits(block.header.difficulty) {
             return Err(BlockValidationError::InvalidProofOfWork);
         }
 
         let weight = block.weight().ok_or(BlockValidationError::WeightOverflow)?;
 
-        if weight > max_block_weight {
+        if weight > params.max_block_weight() {
             return Err(BlockValidationError::BlockTooHeavy {
                 weight,
-                max_weight: max_block_weight,
+                max_weight: params.max_block_weight(),
             });
         }
 
         let is_valid_coinbase_transaction = BlockchainValidator::check_coinbase_transaction(
             block,
-            mining_reward,
+            params.mining_reward(),
             coinbase,
         );
 

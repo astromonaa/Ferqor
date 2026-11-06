@@ -1,6 +1,22 @@
-use std::io::Error;
+//! Ошибки сетевого слоя.
+//!
+//! `PeerError` перенесён из `network::types`; его варианты и вложенные типы
+//! сохранены без изменений.
 
-use crate::{block::EncodingError, codec::DecodingError };
+use std::{io::Error, net::SocketAddr};
+
+use tokio::sync::mpsc::error::{SendError, TrySendError};
+
+use crate::{
+    app::types::InboundMessage,
+    block::EncodingError,
+    codec::DecodingError,
+    network::{
+        peer::types::PeerEvent,
+        protocol::HandshakeError,
+        wire::NetworkMessage,
+    },
+};
 
 #[derive(Debug)]
 pub enum NetworkEncodingError {
@@ -8,7 +24,7 @@ pub enum NetworkEncodingError {
     PayloadLengthOverflow { actual: usize },
     FrameLengthOverflow { actual: usize },
     TypeOverflow,
-    IpEncodingError
+    IpEncodingError,
 }
 
 #[derive(Debug)]
@@ -24,7 +40,7 @@ pub enum NetworkDecodingError {
     PayloadTooLarge { actual: usize, max: usize },
     SocketAddrDecode(DecodingError),
     InvalidIPVersion(u8),
-    HandshakeDecode(DecodingError)
+    HandshakeDecode(DecodingError),
 }
 
 #[derive(Debug)]
@@ -35,5 +51,46 @@ pub enum TransportError {
     DecodingError(NetworkDecodingError),
     InvalidTag,
     UnknownMessageType,
-    InvalidPayloadSize
+    InvalidPayloadSize,
+}
+
+#[derive(Debug)]
+pub enum PeerError {
+    ConnectionError(Error),
+    TransportError(TransportError),
+    NetworkDecodingError(NetworkDecodingError),
+    NetworkEncodingError(NetworkEncodingError),
+    SendToNodeChannelError(SendError<PeerEvent>),
+    SendToStreamChannelError(SendError<NetworkMessage>),
+    SendToAppChannelError(TrySendError<InboundMessage>),
+    EventChannelClosed,
+    AppChannelClosed,
+    ShutDown,
+    HandShake(HandshakeError),
+    ConnectionIdExhausted,
+    ConnectionTimeout(SocketAddr),
+}
+
+impl From<TransportError> for PeerError {
+    fn from(value: TransportError) -> Self {
+        PeerError::TransportError(value)
+    }
+}
+
+impl From<NetworkDecodingError> for PeerError {
+    fn from(value: NetworkDecodingError) -> Self {
+        PeerError::NetworkDecodingError(value)
+    }
+}
+
+impl From<NetworkEncodingError> for PeerError {
+    fn from(value: NetworkEncodingError) -> Self {
+        PeerError::NetworkEncodingError(value)
+    }
+}
+
+impl From<HandshakeError> for PeerError {
+    fn from(value: HandshakeError) -> Self {
+        PeerError::HandShake(value)
+    }
 }

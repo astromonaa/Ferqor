@@ -1,12 +1,18 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use crate::{codec::ByteReader, network::{error::{NetworkDecodingError, NetworkEncodingError}, types::{Handshake, NetworkId, NodeId}}};
+use crate::{
+    codec::ByteReader,
+    network::{
+        error::{NetworkDecodingError, NetworkEncodingError},
+        protocol::{Handshake, NetworkId, NodeId},
+    },
+};
 
-pub const MAX_HANDSHAKE_PAYLOAD_BYTES: usize= 96;
+pub const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 96;
 
 pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, NetworkEncodingError> {
-    /* 
-     * Минимальный capacity для handshake - 77 
+    /*
+     * Минимальный capacity для handshake - 77
      1. Тег HANDSHAKE_V1	12 байт
      2. protocol_version, u8	1 байт
      3. network_id	32 байта
@@ -15,7 +21,9 @@ pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, NetworkEncodin
     */
     let fixed_capacity = 77usize;
     let encoded_addr = encode_socket_addr(handshake.listen_addr)?;
-    let total_capacity = fixed_capacity.checked_add(encoded_addr.len()).ok_or(NetworkEncodingError::TypeOverflow)?;
+    let total_capacity = fixed_capacity
+        .checked_add(encoded_addr.len())
+        .ok_or(NetworkEncodingError::TypeOverflow)?;
     let mut payload = Vec::with_capacity(total_capacity);
 
     payload.extend_from_slice(b"HANDSHAKE_V1");
@@ -29,20 +37,30 @@ pub fn encode_handshake(handshake: &Handshake) -> Result<Vec<u8>, NetworkEncodin
 
 pub fn decode_handshake(bytes: &[u8]) -> Result<Handshake, NetworkDecodingError> {
     let mut reader = ByteReader::new(bytes);
- 
-    reader.expect_tag(b"HANDSHAKE_V1").map_err(NetworkDecodingError::InvalidTag)?;
 
-    let protocol_version: u8 = reader.read().map_err(NetworkDecodingError::HandshakeDecode)?;
-    let network_id = reader.read_exact::<32>().map_err(NetworkDecodingError::HandshakeDecode)?;
-    let node_id = reader.read_exact::<32>().map_err(NetworkDecodingError::HandshakeDecode)?;
+    reader
+        .expect_tag(b"HANDSHAKE_V1")
+        .map_err(NetworkDecodingError::InvalidTag)?;
+
+    let protocol_version: u8 = reader
+        .read()
+        .map_err(NetworkDecodingError::HandshakeDecode)?;
+    let network_id = reader
+        .read_exact::<32>()
+        .map_err(NetworkDecodingError::HandshakeDecode)?;
+    let node_id = reader
+        .read_exact::<32>()
+        .map_err(NetworkDecodingError::HandshakeDecode)?;
     let socket_addr = decode_socket_addr(&mut reader)?;
 
-    reader.finish().map_err(NetworkDecodingError::TrailingBytes)?;
+    reader
+        .finish()
+        .map_err(NetworkDecodingError::TrailingBytes)?;
 
-    Ok(Handshake { 
-        protocol_version, 
-        network_id: NetworkId(network_id), 
-        node_id: NodeId(node_id), 
+    Ok(Handshake {
+        protocol_version,
+        network_id: NetworkId(network_id),
+        node_id: NodeId(node_id),
         listen_addr: socket_addr,
     })
 }

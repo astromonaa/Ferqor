@@ -1,42 +1,33 @@
-use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
+use std::{collections::VecDeque, net::SocketAddr, ops::ControlFlow, sync::Arc};
 
 use tokio::{
     net::TcpListener,
     sync::mpsc::{Sender, channel},
 };
 
-use crate::network::{
-    codec::NetworkDecodeLimits,
-    node::types::{ConnectionId, PeerAction, SendersToStream},
-    peer::Peer,
-    types::{
-        ConnectionInitResult, Handshake, InboundMessage, NetworkMessage, NodeCommand, PeerError,
-        PeerEvent,
+use crate::{
+    app::types::{InboundMessage, NodeCommand},
+    network::{
+        codec::NetworkDecodeLimits,
+        error::PeerError,
+        node::types::{ConnectionInitResult, RetryStatesMap, SendersToStream},
+        peer::{
+            Peer,
+            types::{ConnectionId, PeerAction, PeerDisconnectReason, PeerEvent},
+        },
+        protocol::Handshake,
+        wire::NetworkMessage,
     },
 };
 
 /* Установка слушателей на внешнее (Tcp) соединение */
-pub async fn accept_listener(
-    listener: &TcpListener,
-    limits: Arc<NetworkDecodeLimits>,
-    sender_to_node: Sender<PeerEvent>,
-    local_handshake: Handshake,
-    connections_count: &mut u64,
-) -> Result<ConnectionInitResult, PeerError> {
-    match listener.accept().await {
-        Ok((stream, addr)) => {
-            let peer = Peer::from_stream(stream);
-            init_peer_connection(
-                peer,
-                limits,
-                sender_to_node,
-                addr,
-                local_handshake,
-                connections_count,
-            )
-        }
-        Err(e) => return Err(PeerError::ConnectionError(e)),
-    }
+pub async fn accept_listener(listener: &TcpListener) -> Result<(SocketAddr, Peer), PeerError> {
+    let (stream, addr) = listener
+        .accept()
+        .await
+        .map_err(PeerError::ConnectionError)?;
+
+    Ok((addr, Peer::from_stream(stream)))
 }
 
 pub fn init_peer_connection(
@@ -53,8 +44,10 @@ pub fn init_peer_connection(
     *connections_count = (*connections_count)
         .checked_add(1)
         .ok_or(PeerError::ConnectionIdExhausted)?;
-    
+
     let connection_id = ConnectionId(*connections_count);
+
+    let mut disconnect_reason = PeerDisconnectReason::ConnectionClosed;
 
     /* Peer start */
     let task = tokio::spawn(async move {
@@ -65,20 +58,25 @@ pub fn init_peer_connection(
                 sender_to_node.clone(),
                 receiver_in_stream,
                 local_handshake,
-                connection_id
+                connection_id,
             )
             .await
         {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Error while handling stream data {e:?}");
+                disconnect_reason = e.into();
             }
         }
         /* После завершения таски дропаем соединение */
         drop(peer);
         /* После отправляем событие о закрытии соединения в канал */
         if sender_to_node
-            .send(PeerEvent::Disconnected(addr, connection_id))
+            .send(PeerEvent::Disconnected(
+                addr,
+                connection_id,
+                disconnect_reason,
+            ))
             .await
             .is_err()
         {
@@ -95,11 +93,13 @@ pub fn init_peer_connection(
 }
 
 /* Обработка сообщений поступающих из соединения (Tcp) */
-pub async fn handle_peer_event(
+pub fn handle_peer_event(
     message: PeerEvent,
     senders_to_stream: &mut SendersToStream,
     node_to_app_sender: &Sender<InboundMessage>,
     local_handshake: Handshake,
+    pending_addresses: &mut VecDeque<SocketAddr>,
+    retry_states: &mut RetryStatesMap,
 ) -> Result<(), PeerError> {
     match message {
         PeerEvent::Message(addr, network_message, connection_id) => {
@@ -116,20 +116,51 @@ pub async fn handle_peer_event(
                 NetworkMessage::Handshake(remote_handshake) => {
                     let action =
                         peer_handle.on_handshake_receive(local_handshake, remote_handshake)?;
-                    handle_peer_action(action, senders_to_stream, addr, connection_id);
+
+                    if matches!(action, PeerAction::Continue) {
+                        println!("Peer activated: addr={addr}, connection_id={connection_id:?}");
+                        if let Some(retry_state) = retry_states.get_mut(&addr) {
+                            retry_state.reset();
+                        }
+                    }
+
+                    handle_peer_action(
+                        action,
+                        senders_to_stream,
+                        addr,
+                        connection_id,
+                        pending_addresses,
+                        retry_states,
+                    );
                 }
                 _ => {
-                    let action = peer_handle
-                        .on_message_receive(network_message, node_to_app_sender, addr)
-                        .await?;
-                    handle_peer_action(action, senders_to_stream, addr, connection_id);
+                    let action = peer_handle.on_message_receive(
+                        network_message,
+                        node_to_app_sender,
+                        addr,
+                    )?;
+                    handle_peer_action(
+                        action,
+                        senders_to_stream,
+                        addr,
+                        connection_id,
+                        pending_addresses,
+                        retry_states,
+                    );
                 }
             }
         }
-        /* В случае Disconnect удаляем адрес из HashMap */
-        PeerEvent::Disconnected(addr, connection_id) => {
-            handle_peer_action(PeerAction::Disconnect, senders_to_stream, addr, connection_id)
-        }
+        /*
+           В случае Disconnect удаляем адрес из HashMap
+        */
+        PeerEvent::Disconnected(addr, connection_id, reason) => handle_peer_action(
+            PeerAction::Disconnect(reason),
+            senders_to_stream,
+            addr,
+            connection_id,
+            pending_addresses,
+            retry_states,
+        ),
     }
 
     Ok(())
@@ -140,9 +171,11 @@ fn handle_peer_action(
     action: PeerAction,
     senders_to_stream: &mut SendersToStream,
     addr: SocketAddr,
-    connection_id: ConnectionId
+    connection_id: ConnectionId,
+    pending_addresses: &mut VecDeque<SocketAddr>,
+    retry_states: &mut RetryStatesMap,
 ) {
-    if matches!(action, PeerAction::Disconnect) {
+    if matches!(action, PeerAction::Disconnect(_)) {
         let Some(peer_handle) = senders_to_stream.get(&addr) else {
             return;
         };
@@ -150,8 +183,18 @@ fn handle_peer_action(
         if peer_handle.connection_id != connection_id {
             return;
         }
-        
+
         senders_to_stream.remove(&addr);
+    }
+
+    match action {
+        PeerAction::Disconnect(PeerDisconnectReason::ConnectionClosed) => {
+            if let Some(retry_state) = retry_states.get_mut(&addr) {
+                retry_state.record_failure();
+                pending_addresses.push_back(addr);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -159,13 +202,20 @@ fn handle_peer_action(
 pub fn handle_app_command(
     command: NodeCommand,
     senders_to_stream: &mut SendersToStream,
+    pending_addresses: &mut VecDeque<SocketAddr>,
+    retry_states: &mut RetryStatesMap,
 ) -> Result<ControlFlow<()>, PeerError> {
     match command {
         NodeCommand::SendTo(addr, message) => {
-            let sender_to_stream = senders_to_stream.get(&addr);
-            if let Some(sender) = sender_to_stream {
-                if sender.send(message).is_err() {
+            if let Some(sender) = senders_to_stream.get(&addr) {
+                if let Err(error) = sender.send(message) {
                     senders_to_stream.remove(&addr);
+                    eprintln!("Cannot queue message for peer {addr}: {error}");
+                    /* Зафиксировать failure и добавить адрес в pendind_addresses */
+                    if let Some(retry_state) = retry_states.get_mut(&addr) {
+                        retry_state.record_failure();
+                        pending_addresses.push_back(addr);
+                    }
                 }
             } else {
                 println!("Sender not found");
@@ -178,12 +228,18 @@ pub fn handle_app_command(
                   Если произошла ошибка отправки конкретному адресу,
                   закрываем канал общения с данным клиентом
                 */
-                if sender.send(message.clone()).is_err() {
+                if let Err(error) = sender.send(message.clone()) {
                     failed_senders.push(*addr);
+                    eprintln!("Cannot queue message for peer {addr}: {error}");
                 }
             }
             for addr in failed_senders.iter() {
                 senders_to_stream.remove(addr);
+                /* Зафиксировать failure и добавить адрес в pendind_addresses */
+                if let Some(retry_state) = retry_states.get_mut(&addr) {
+                    retry_state.record_failure();
+                    pending_addresses.push_back(*addr);
+                }
             }
         }
         NodeCommand::BroadcastExcept(addr, message) => {
@@ -196,16 +252,26 @@ pub fn handle_app_command(
                   Если произошла ошибка отправки конкретному адресу,
                   закрываем канал общения с данным клиентом
                 */
-                if sender.send(message.clone()).is_err() {
+                if let Err(error) = sender.send(message.clone()) {
                     failed_senders.push(*address);
+                    eprintln!("Cannot queue message for peer {address}: {error}");
                 }
             }
             for addr in failed_senders.iter() {
                 senders_to_stream.remove(addr);
+                if let Some(retry_state) = retry_states.get_mut(&addr) {
+                    /* Зафиксировать failure и добавить адрес в pendind_addresses */
+                    retry_state.record_failure();
+                    pending_addresses.push_back(*addr);
+                }
             }
         }
         NodeCommand::Disconnect(addr) => {
             senders_to_stream.remove(&addr);
+            pending_addresses.retain(|address| *address != addr);
+            if let Some(retry_state) = retry_states.get_mut(&addr) {
+                retry_state.disable();
+            }
         }
         NodeCommand::Shutdown => return Ok(ControlFlow::Break(())),
     }

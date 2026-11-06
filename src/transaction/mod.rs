@@ -1,4 +1,8 @@
-pub mod transaction;
 pub mod codec;
-pub use transaction::{Transaction, TransactionId};
+mod commitment;
+pub mod transaction;
 pub use codec::*;
+pub use transaction::{Transaction, TransactionId};
+
+#[cfg(test)]
+mod codec_tests;

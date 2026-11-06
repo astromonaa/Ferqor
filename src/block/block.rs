@@ -1,7 +1,8 @@
 use crate::{
-    block::{encode_block_header, calculate_empty_merkle_root, encode_merkle_node}, blockchain::utils::{Difficulty, MAX_DIFFICULTY}, transaction::Transaction,
+    block::commitment,
+    consensus::{Difficulty, MAX_DIFFICULTY},
+    transaction::Transaction,
 };
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -17,7 +18,7 @@ pub struct BlockHeader {
     pub difficulty: Difficulty,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Copy)]
 pub struct BlockHash(pub [u8; 32]);
 
 impl BlockHash {
@@ -95,35 +96,11 @@ impl Block {
     }
 
     pub fn calculate_merkle_root(transactions: &[Arc<Transaction>]) -> MerkleRoot {
-        if transactions.is_empty() {
-            return calculate_empty_merkle_root();
-        };
-
-        let mut hashes: Vec<[u8; 32]> = transactions.iter().map(|tx| tx.txid().0).collect();
-
-        while hashes.len() > 1 {
-            if hashes.len() % 2 != 0 {
-                let last = *hashes.last().unwrap();
-                hashes.push(last);
-            }
-
-            hashes = hashes
-                .chunks(2)
-                .map(|pair| {
-                    let payload = encode_merkle_node(&pair[0], &pair[1]);
-                    Sha256::digest(payload).into()
-                })
-                .collect();
-        }
-
-        MerkleRoot(hashes[0])
+        commitment::calculate_merkle_root(transactions)
     }
 
     pub fn calculate_hash(header: &BlockHeader) -> BlockHash {
-        let payload = encode_block_header(header);
-
-        let hash: [u8; 32] = Sha256::digest(payload).into();
-        BlockHash(hash)
+        commitment::calculate_block_hash(header)
     }
 
     pub fn mine_block(&mut self) {

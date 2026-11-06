@@ -1,323 +1,248 @@
-use crate::address::{Address, Balances, COINBASE};
-use crate::block::Block;
-use crate::block::block::BlockHash;
-use crate::blockchain::difficulty::expected_difficulty_for_next_block;
-use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError, MiningError};
-use crate::blockchain::validator::BlockchainValidator;
-use crate::config::{GenesisConfig, GenesisData};
-use crate::mempool::Mempool;
-use crate::transaction::Transaction;
-use std::collections::HashMap;
+//! Публичный фасад блокчейна, сохранённый из прежнего
+//! `blockchain::blockchain::Blockchain`.
+//!
+//! Тип координирует выделенные `Chain`, `Mempool` и `BlockProducer`, сохраняя имена
+//! операций `new`, `add_block`, `receive_block`, `add_transaction`,
+//! `mine_pending_transactions` и `is_valid` без изменения их семантики.
+
 use std::sync::Arc;
 
+use crate::address::{Address, COINBASE};
+use crate::block::Block;
+use crate::blockchain::error::{BlockAcceptanceError, BlockValidationError, MiningError};
+use crate::chain::Chain;
+use crate::config::GenesisData;
+use crate::consensus::ConsensusParams;
+use crate::ledger::LedgerState;
+use crate::mempool::Mempool;
+use crate::mining::BlockProducer;
+use crate::transaction::Transaction;
+
+/// Объединяет `Chain`, `Mempool` и `BlockProducer` логикой, перенесённой из
+/// прежнего `blockchain::blockchain::Blockchain`.
 pub struct Blockchain {
-    pub chain: Vec<Block>,
-    pub mempool: Mempool,
-    pub balances: Balances,
-    pub mining_reward: u64,
-    pub initial_balances: Balances,
-    pub nonces: HashMap<Address, u64>,
-    pub initial_nonces: HashMap<Address, u64>,
-    pub max_block_weight: usize,
+    chain: Chain,
+    mempool: Mempool,
+    block_producer: BlockProducer,
 }
 
 impl Blockchain {
-    pub fn new(genesis_data: GenesisData) -> Result<Self, BlockValidationError> {
-        let mut chain = Vec::new();
-        let GenesisData {
-            mut genesis_block,
-            initial_balances,
-            max_block_weight,
-        } = genesis_data;
+    /// Инициализирует состояние логикой из прежнего
+    /// `blockchain::blockchain::Blockchain::new`.
+    ///
+    /// Добыча по-прежнему выполняется исходным `Block::mine_block`, сохраняя порядок
+    /// проверок, ошибки и байты блока.
+    pub fn new(mut genesis_data: GenesisData) -> Result<Self, BlockValidationError> {
+        Chain::validate_genesis_candidate(&genesis_data.genesis_block)?;
 
-        let expected_merkle_root = Block::calculate_merkle_root(&genesis_block.transactions);
-
-        if genesis_block.header.merkle_root != expected_merkle_root {
-            return Err(BlockValidationError::MerkleRootMismatch);
-        }
-        if genesis_block.header.index != 0 {
-            return Err(BlockValidationError::UnexpectedIndex {
-                expected: 0,
-                actual: genesis_block.header.index,
-            });
-        }
-
-        genesis_block.mine_block();
-        chain.push(genesis_block);
+        let block_producer = BlockProducer;
+        genesis_data.genesis_block.mine_block();
+        let chain = Chain::from_validated_genesis(genesis_data);
 
         Ok(Self {
             chain,
             mempool: Mempool::new(),
-            balances: initial_balances.clone(),
-            mining_reward: 50,
-            initial_balances,
-            nonces: HashMap::new(),
-            initial_nonces: HashMap::new(),
-            max_block_weight,
+            block_producer,
         })
     }
 
-    fn create_block(
-        &self,
-        transactions: Vec<Arc<Transaction>>,
-    ) -> Result<Block, BlockValidationError> {
-        let Some(previous_block) = self.chain.last() else {
-            return Err(BlockValidationError::MissingChainTip);
-        };
-        let index = previous_block
-            .header
-            .index
-            .checked_add(1)
-            .ok_or(BlockValidationError::IndexOverflow)?;
-        let now = GenesisConfig::get_now_timestamp();
-        let next_difficulty = expected_difficulty_for_next_block(&self.chain)?;
-        let new_block = Block::new(
-            index,
-            transactions,
-            previous_block.hash,
-            0,
-            now,
-            next_difficulty,
-        );
-        Ok(new_block)
+    /// Предоставляет агрегат вместо прежнего публичного поля `Blockchain::chain`.
+    pub fn chain(&self) -> &Chain {
+        &self.chain
     }
 
-    fn validate_candidate(&self, candidate: &Block) -> Result<(), BlockAcceptanceError> {
-        /* Проверяем валидность нового блока */
-        BlockchainValidator::validate_next_block(
-            &self.chain,
-            candidate,
-            COINBASE,
-            self.max_block_weight,
-            self.mining_reward,
-        )
-        .map_err(BlockAcceptanceError::Validation)
+    /// Предоставляет блоки из прежнего публичного поля `Blockchain::chain`.
+    pub fn blocks(&self) -> &[Block] {
+        self.chain.blocks()
     }
 
-    fn commit_block(
-        &mut self,
-        candidate: Block,
-        next_balances: Balances,
-        next_nonces: HashMap<Address, u64>,
-    ) {
-        /* Удаляем транзакции из mempool  */
-        for tx in candidate.transactions.iter().skip(1) {
-            self.mempool.remove(&tx.txid());
-        }
-
-        /* После успешной проверки добавляем блок в цепь */
-        self.balances = next_balances;
-        self.nonces = next_nonces;
-        self.chain.push(candidate);
+    /// Предоставляет реестр вместо прежних полей `Blockchain::balances` и
+    /// `Blockchain::nonces`.
+    pub fn ledger(&self) -> &LedgerState {
+        self.chain.ledger()
     }
 
-    pub fn add_block(
+    /// Предоставляет пул из прежнего публичного поля `Blockchain::mempool`.
+    pub fn mempool(&self) -> &Mempool {
+        &self.mempool
+    }
+
+    /// Предоставляет сгруппированные прежние поля `Blockchain::mining_reward`,
+    /// `Blockchain::max_block_weight` и константы сложности.
+    pub fn consensus_params(&self) -> &ConsensusParams {
+        self.chain.consensus_params()
+    }
+
+    /// Возвращает значение прежнего поля `Blockchain::mining_reward`.
+    pub fn mining_reward(&self) -> u64 {
+        self.consensus_params().mining_reward()
+    }
+
+    /// Возвращает значение прежнего поля `Blockchain::max_block_weight`.
+    pub fn max_block_weight(&self) -> usize {
+        self.consensus_params().max_block_weight()
+    }
+
+    /// Сохраняет порядок операций прежнего
+    /// `blockchain::blockchain::Blockchain::receive_block`: валидация, расчёт
+    /// следующего состояния, очистка пула и только затем фиксация цепочки.
+    pub fn receive_block(&mut self, candidate: Block) -> Result<(), BlockAcceptanceError> {
+        self.chain.validate_candidate(&candidate)?;
+        let next_ledger = self.chain.ledger().apply_block(&candidate, COINBASE)?;
+        self.remove_committed_transactions(&candidate);
+        self.chain.commit_block(candidate, next_ledger);
+        Ok(())
+    }
+
+    /// Сохраняет логику прежнего `Blockchain::add_block`:
+    /// `BlockProducer` создаёт блок, а исходный `Block::mine_block` выполняет добычу.
+    pub fn create_block(
         &mut self,
         transactions: Vec<Arc<Transaction>>,
-    ) -> Result<(), BlockAcceptanceError> {
-        let mut candidate = self
-            .create_block(transactions)
+    ) -> Result<Option<(Block, LedgerState)>, BlockAcceptanceError> {
+        let candidate = self
+            .block_producer
+            .create_block(&self.chain, transactions)
             .map_err(BlockAcceptanceError::Validation)?;
 
-        /* Вычисляем новое состояние после применения блока */
-        let (next_balances, next_nonces) = BlockchainValidator::calculate_next_state(
-            &self.balances,
-            &self.nonces,
-            &candidate,
-            COINBASE,
-        )?;
+        // Прежний `Blockchain::add_block` вычислял состояние ровно один раз до PoW.
+        let next_ledger = self.chain.ledger().apply_block(&candidate, COINBASE)?;
 
-        /* После успешной проверки майним блок */
-        candidate.mine_block();
-
-        /* Проверяем валидность нового блока */
-        self.validate_candidate(&candidate)?;
-
-        /* После успешной проверки добавляем блок в цепь */
-        self.commit_block(candidate, next_balances, next_nonces);
-
-        Ok(())
+        // candidate.mine_block();
+        Ok(Some((candidate, next_ledger)))
     }
 
-    pub fn receive_block(&mut self, candidate: Block) -> Result<(), BlockAcceptanceError> {
-        /* Проверяем валидность полученного блока */
-        self.validate_candidate(&candidate)?;
+    pub fn add_block(&mut self, block: Block, next_ledger: LedgerState) -> Result<Block, BlockAcceptanceError> {
+        self.chain.validate_candidate(&block)?;
+        self.remove_committed_transactions(&block);
+        self.chain.commit_block(block.clone(), next_ledger);
 
-        /* Вычисляем новое состояние после применения блока */
-        let (next_balances, next_nonces) = BlockchainValidator::calculate_next_state(
-            &self.balances,
-            &self.nonces,
-            &candidate,
-            COINBASE,
-        )?;
-
-        /* После успешной проверки добавляем блок в цепь */
-        self.commit_block(candidate, next_balances, next_nonces);
-
-        Ok(())
+        Ok(block)
     }
 
+    /// Сохраняет приём в пул из прежнего `Blockchain::add_transaction` без изменений.
     pub fn add_transaction(&mut self, transaction: Transaction) -> bool {
         if transaction.from == COINBASE {
             return false;
         }
 
-        let from_balance = self.balances.get(&transaction.from).copied().unwrap_or(0);
-        let current_nonce = self.nonces.get(&transaction.from).copied().unwrap_or(0);
-
+        let from_balance = self.ledger().balance(&transaction.from);
+        let current_nonce = self.ledger().nonce(&transaction.from);
         let pending_count = self.mempool.pending_count(&transaction.from);
 
-        /* Даем возможность отправить несколько транзакций в mempool */
         let Some(expected_nonce) = current_nonce.checked_add(pending_count) else {
             return false;
         };
 
-        /* Проверяем, что nonce в порядке */
         if transaction.nonce != expected_nonce {
             return false;
         };
 
-        /* Считаем стоимость всех транзакций пользователя в mempool */
         let Some(pending_cost) = self.mempool.pending_cost(&transaction.from) else {
             return false;
         };
-
-        /* Считаем стоимость новой транзакции */
-        let Some(tx_cost) = transaction.amount.checked_add(transaction.fee) else {
+        let Some(transaction_cost) = transaction.amount.checked_add(transaction.fee) else {
+            return false;
+        };
+        let Some(total_cost) = pending_cost.checked_add(transaction_cost) else {
             return false;
         };
 
-        /* Считаем общую стоимость всех транзакций пользователя с учетом текущей */
-        let Some(total_cost) = pending_cost.checked_add(tx_cost) else {
+        if from_balance < total_cost || !transaction.is_valid() {
             return false;
-        };
-
-        /* Если стоимость больше баланса пользователя, не добавляем */
-        if from_balance < total_cost {
-            return false;
-        };
-
-        if !transaction.is_valid() {
-            return false;
-        };
+        }
 
         self.mempool.insert(transaction)
     }
 
-    fn get_reward_transaction(
-        &self,
-        miner_address: Address,
-        total_fees: u64,
-    ) -> Option<Arc<Transaction>> {
-        let amount = self.mining_reward.checked_add(total_fees)?;
-        Some(Arc::new(Transaction {
-            from: COINBASE,
-            to: miner_address,
-            amount,
-            signature: None,
-            public_key: None,
-            fee: 0,
-            nonce: 0,
-        }))
-    }
+    /// Формирует и добывает блок из подходящих транзакций mempool.
+    ///
+    /// Метод сохраняет расчёт вместимости, комиссий и награды из прежнего
+    /// `Blockchain::mine_pending_transactions`. Он выполняет следующие шаги:
+    ///
+    /// 1. Резервирует в блоке место для обязательной coinbase-транзакции.
+    /// 2. Выбирает из mempool обычные транзакции, которые помещаются в оставшийся
+    ///    вес и образуют корректные последовательности nonce для отправителей.
+    /// 3. Безопасно суммирует комиссии и создаёт coinbase с базовой наградой и fee.
+    /// 4. Помещает coinbase на обязательную позицию `0` и передаёт транзакции в
+    ///    `add_block`, где блок создаётся, добывается, валидируется и фиксируется.
+    ///
+    /// Если подходящих обычных транзакций нет, новый блок не создаётся.
+    pub fn mine_pending_transactions(&mut self, miner_address: Address) -> Result<Option<(Block, LedgerState)>, MiningError> {
+        let max_block_weight = self.consensus_params().max_block_weight();
 
-    pub fn mine_pending_transactions(&mut self, miner_address: Address) -> Result<(), MiningError> {
-        /* Из максимальной весовой емкости вычитываем сперва вес Coinbase транзакции */
-        let available_weight = self
-            .max_block_weight
+        // `select_transactions` выбирает только обычные транзакции из mempool, но
+        // итоговый блок дополнительно содержит coinbase. Поэтому её фиксированный
+        // вес заранее вычитается из общего consensus-лимита блока.
+        //
+        // `checked_sub` не позволяет `usize` уйти ниже нуля, если конфигурация
+        // задаёт лимит меньше веса обязательной coinbase. Вместо переполнения метод
+        // возвращает явную ошибку `BlockCapacityTooSmall`.
+        let available_weight = max_block_weight
             .checked_sub(Transaction::FIXED_WEIGHT)
             .ok_or(MiningError::BlockCapacityTooSmall {
                 required: Transaction::FIXED_WEIGHT,
-                max_weight: self.max_block_weight,
+                max_weight: max_block_weight,
             })?;
 
+        // `available_weight` — часть лимита блока, оставшаяся для обычных транзакций
+        // после резервирования coinbase. Текущие nonce реестра задают первый
+        // допустимый nonce каждого отправителя; mempool не пропускает разрывы.
         let pending_transactions = self
             .mempool
-            .select_transactions(available_weight, &self.nonces);
+            .select_transactions(available_weight, self.ledger().nonces());
 
+        // Пустой блок только с наградой здесь не добывается: майнинг запускается,
+        // только если mempool предоставил хотя бы одну подходящую транзакцию.
         if pending_transactions.is_empty() {
-            return Ok(());
-        };
+            return Ok(None);
+        }
 
+        // `try_fold` складывает fee без оборачивания `u64`. Переполнение означает,
+        // что корректную итоговую coinbase-награду представить невозможно.
         let total_fees = pending_transactions
             .iter()
-            .try_fold(0u64, |acc, tx| acc.checked_add(tx.fee))
+            .try_fold(0u64, |acc, transaction| acc.checked_add(transaction.fee))
             .ok_or(MiningError::FeeOverflow)?;
 
-        let reward_tx = self
-            .get_reward_transaction(miner_address, total_fees)
+        // Итоговая награда равна базовой награде из ConsensusParams плюс total_fees.
+        // Внутри также используется checked_add, поэтому переполнение возвращается
+        // как `RewardOverflow`, а не создаёт транзакцию с некорректной суммой.
+        let reward_transaction = self
+            .block_producer
+            .get_reward_transaction(self.consensus_params(), miner_address, total_fees)
             .ok_or(MiningError::RewardOverflow)?;
 
+        // Ёмкость известна заранее: одна coinbase и все выбранные транзакции.
+        // Coinbase обязана находиться первой — валидатор интерпретирует позицию `0`
+        // как единственную наградную транзакцию и считает fee начиная с позиции `1`.
+        // При `cloned` копируется только `Arc`, а не содержимое каждой Transaction.
         let mut transactions = Vec::with_capacity(pending_transactions.len() + 1);
-        transactions.push(reward_tx);
+        transactions.push(reward_transaction);
         transactions.extend(pending_transactions.iter().cloned());
 
-        self.add_block(transactions)
-            .map_err(MiningError::BlockAcceptance)?;
-
-        Ok(())
+        // `add_block` сохраняет исходный порядок операций: создаёт кандидата,
+        // рассчитывает следующее состояние, выполняет PoW, валидирует и фиксирует блок.
+        self.create_block(transactions)
+            .map_err(MiningError::BlockAcceptance)
     }
 
-    fn is_valid_genesis_block(&self) -> bool {
-        /* Проверяем вес генезис-блока */
-        let Some(genesis_block) = self.chain.first() else {
-            return false;
-        };
-
-        if genesis_block.header.index != 0 {
-            return false;
-        }
-
-        let expected_merkle_root = Block::calculate_merkle_root(&genesis_block.transactions);
-
-        if genesis_block.header.merkle_root != expected_merkle_root {
-            return false;
-        }
-
-        if genesis_block.header.previous_hash != BlockHash([0u8; 32]) {
-            return false;
-        }
-
-        if !BlockchainValidator::check_block_weight(genesis_block, self.max_block_weight) {
-            return false;
-        }
-
-        let calculated_hash = Block::calculate_hash(&genesis_block.header);
-
-        if calculated_hash != genesis_block.hash {
-            return false;
-        }
-
-        if !calculated_hash.has_leading_zero_hex_digits(genesis_block.header.difficulty) {
-            return false;
-        }
-
-        true
-    }
-
+    /// Сохраняет проверку из прежнего `Blockchain::is_valid`.
     pub fn is_valid(&self) -> bool {
-        /* Проверяем валидность генезис-блока */
-        if !self.is_valid_genesis_block() {
-            return false;
-        }
-        /* Проверяем вес и транзакции остальных блоков */
-        for index in 1..self.chain.len() {
-            let current_block = &self.chain[index];
-            let previous_chain = &self.chain[..index];
+        self.chain.is_valid()
+    }
 
-            if BlockchainValidator::validate_next_block(
-                previous_chain,
-                current_block,
-                COINBASE,
-                self.max_block_weight,
-                self.mining_reward,
-            )
-            .is_err()
-            {
-                return false;
-            }
+    /// Удаляет из пула транзакции блока логикой из прежнего
+    /// `Blockchain::commit_block`, пропуская coinbase на позиции `0`.
+    fn remove_committed_transactions(&mut self, candidate: &Block) {
+        for transaction in candidate.transactions.iter().skip(1) {
+            self.mempool.remove(&transaction.txid());
         }
+    }
 
-        BlockchainValidator::validate_state_transitions(self, COINBASE)
+    /// Заменяет прямое изменение прежних полей состояния в тестах.
+    #[cfg(test)]
+    pub(crate) fn ledger_mut_for_test(&mut self) -> &mut LedgerState {
+        self.chain.ledger_mut_for_test()
     }
 }

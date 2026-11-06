@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use super::*;
-use crate::{address::Address, config::GenesisConfig, transaction::Transaction, wallet::Wallet};
+use crate::{
+    address::Address, blockchain::Blockchain, config::GenesisConfig, transaction::Transaction,
+    wallet::Wallet,
+};
 use ed25519_dalek::Signature;
 
 #[test]
@@ -113,13 +115,31 @@ fn should_accept_first_transaction() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
     let tx = alice.create_transaction(bob.address, 50, 5, 0);
 
     let success = blockchain.add_transaction(tx);
 
     assert_eq!(success, true);
+}
+
+#[test]
+fn genesis_config_threads_consensus_params_into_blockchain() {
+    let initial_config =
+        GenesisConfig::get_config(None, Some(2_000), 4).expect("valid genesis config");
+
+    let blockchain = Blockchain::new(initial_config).unwrap();
+
+    assert_eq!(blockchain.mining_reward(), 50);
+    assert_eq!(blockchain.max_block_weight(), 2_000);
+    assert_eq!(blockchain.consensus_params().target_block_time(), 10);
+    assert_eq!(
+        blockchain
+            .consensus_params()
+            .difficulty_adjustment_interval(),
+        10
+    );
 }
 
 fn create_transactions(wallet: &Wallet, count: u64, to: Address) -> Vec<Transaction> {
@@ -147,7 +167,7 @@ fn should_accept_transaction_with_valid_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -172,7 +192,7 @@ fn should_accept_transaction_while_there_are_pending_transactions() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -201,7 +221,7 @@ fn should_not_accept_transaction_with_skipped_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
     let txs = create_transactions(&alice, 5, bob.address);
     add_transactions(&mut blockchain, txs);
@@ -218,15 +238,15 @@ fn should_not_accept_transaction_with_skipped_nonce() {
     let tx8 = alice.create_transaction(bob.address, 10, 1, 8);
     let tx8_id = tx8.txid();
 
-    let pending_count_before = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_before = blockchain.mempool().pending_count(&alice.address);
 
     let success = blockchain.add_transaction(tx8);
 
-    let pending_count_after = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_after = blockchain.mempool().pending_count(&alice.address);
 
     assert!(!success);
     assert_eq!(pending_count_after, pending_count_before);
-    assert!(!blockchain.mempool.contains(&tx8_id));
+    assert!(!blockchain.mempool().contains(&tx8_id));
 }
 
 #[test]
@@ -238,30 +258,32 @@ fn should_not_accept_if_nonce_overflows() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
-    blockchain.nonces.insert(alice.address, u64::MAX);
+    blockchain
+        .ledger_mut_for_test()
+        .set_nonce_for_test(alice.address, u64::MAX);
 
     let tx1 = alice.create_transaction(bob.address, 10, 1, u64::MAX);
     let tx1_id = tx1.txid();
 
     assert!(blockchain.add_transaction(tx1));
-    assert!(blockchain.mempool.contains(&tx1_id));
-    assert_eq!(blockchain.mempool.pending_count(&alice.address), 1);
+    assert!(blockchain.mempool().contains(&tx1_id));
+    assert_eq!(blockchain.mempool().pending_count(&alice.address), 1);
 
     let tx2 = alice.create_transaction(bob.address, 10, 1, 1);
     let tx2_id = tx2.txid();
 
-    let pending_count_before = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_before = blockchain.mempool().pending_count(&alice.address);
 
     let success = blockchain.add_transaction(tx2);
 
-    let pending_count_after = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_after = blockchain.mempool().pending_count(&alice.address);
 
     assert!(!success);
     assert_eq!(pending_count_after, pending_count_before);
-    assert!(blockchain.mempool.contains(&tx1_id));
-    assert!(!blockchain.mempool.contains(&tx2_id));
+    assert!(blockchain.mempool().contains(&tx1_id));
+    assert!(!blockchain.mempool().contains(&tx2_id));
 }
 
 #[test]
@@ -273,8 +295,10 @@ fn should_accept_last_tx_with_u64_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
-    blockchain.nonces.insert(alice.address, u64::MAX - 1);
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
+    blockchain
+        .ledger_mut_for_test()
+        .set_nonce_for_test(alice.address, u64::MAX - 1);
 
     let tx = alice.create_transaction(bob.address, 10, 1, u64::MAX - 1);
 
@@ -296,22 +320,24 @@ fn should_not_accept_transaction_with_stale_nonce() {
         GenesisConfig::get_config(Some(HashMap::from([(alice.address, 200)])), None, 4)
             .expect("valid genesis config");
 
-    let mut blockchain = blockchain::Blockchain::new(initial_config).unwrap();
+    let mut blockchain = Blockchain::new(initial_config).unwrap();
 
-    blockchain.nonces.insert(alice.address, 7);
+    blockchain
+        .ledger_mut_for_test()
+        .set_nonce_for_test(alice.address, 7);
 
     let tx = alice.create_transaction(bob.address, 10, 1, 6);
     let tx_id = tx.txid();
 
-    let pending_count_before = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_before = blockchain.mempool().pending_count(&alice.address);
 
     let success = blockchain.add_transaction(tx);
 
-    let pending_count_after = blockchain.mempool.pending_count(&alice.address);
+    let pending_count_after = blockchain.mempool().pending_count(&alice.address);
 
     assert!(!success);
     assert_eq!(pending_count_after, pending_count_before);
-    assert!(!blockchain.mempool.contains(&tx_id));
+    assert!(!blockchain.mempool().contains(&tx_id));
 }
 
 #[test]
@@ -336,4 +362,37 @@ fn transaction_fails_if_nonce_changes() {
     tx.nonce = 2;
 
     assert!(!tx.is_valid());
+}
+
+// Проверяет полный асинхронный mining pipeline: подготовка кандидата в Blockchain,
+// выполнение PoW вне владельца состояния и commit возвращённого результата.
+#[test]
+fn mines_pending_transactions_through_blockchain() {
+    let alice = Wallet::new();
+    let bob = Wallet::new();
+    let genesis_data =
+        GenesisConfig::get_config(Some(HashMap::from([(alice.address, 100)])), None, 4)
+            .expect("valid genesis config");
+    let mut blockchain = Blockchain::new(genesis_data).expect("valid genesis block");
+    let transaction = alice.create_transaction(bob.address, 50, 5, 0);
+
+    assert!(blockchain.add_transaction(transaction));
+    let Some((mut candidate, next_ledger)) = blockchain
+        .mine_pending_transactions(alice.address)
+        .expect("candidate creation should succeed")
+    else {
+        panic!("pending transaction should produce a candidate");
+    };
+
+    candidate.mine_block();
+    blockchain
+        .add_block(candidate, next_ledger)
+        .expect("mined block should be committed");
+
+    assert_eq!(blockchain.blocks().len(), 2);
+    assert_eq!(blockchain.ledger().balance(&alice.address), 100);
+    assert_eq!(blockchain.ledger().balance(&bob.address), 50);
+    assert_eq!(blockchain.ledger().nonce(&alice.address), 1);
+    assert_eq!(blockchain.mempool().pending_count(&alice.address), 0);
+    assert!(blockchain.is_valid());
 }

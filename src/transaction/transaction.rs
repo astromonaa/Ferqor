@@ -1,8 +1,9 @@
-use std::cmp::Ordering;
-use crate::{address::{Address, COINBASE, address_from_public_key}, transaction::{encode_transaction, hash_transaction_signing_payload}};
+use crate::{
+    address::{Address, COINBASE, address_from_public_key},
+    transaction::commitment,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
-
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId(pub [u8; 32]);
@@ -21,7 +22,7 @@ impl PartialOrd for TransactionId {
 
 impl TransactionId {
     pub fn as_bytes(&self) -> &[u8; 32] {
-        return &self.0
+        return &self.0;
     }
 }
 #[derive(Debug, Clone)]
@@ -36,13 +37,10 @@ pub struct Transaction {
 }
 
 impl Transaction {
-
     pub const FIXED_WEIGHT: usize = 1;
 
     pub fn txid(&self) -> TransactionId {
-        let payload = encode_transaction(&self);
-        let hash: [u8; 32] = Sha256::digest(payload).into();
-        TransactionId(hash)
+        commitment::calculate_transaction_id(self)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -72,7 +70,13 @@ impl Transaction {
             return false;
         };
 
-        let payload_hash = hash_transaction_signing_payload(&self.from, &self.to, self.amount, self.fee, self.nonce);
+        let payload_hash = commitment::hash_transaction_signing_payload(
+            &self.from,
+            &self.to,
+            self.amount,
+            self.fee,
+            self.nonce,
+        );
         public_key.verify(&payload_hash, signature).is_ok()
     }
 

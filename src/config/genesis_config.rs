@@ -2,8 +2,8 @@ use crate::address::Balances;
 use crate::block::Block;
 use crate::block::block::BlockHash;
 use crate::blockchain::error::BlockchainError;
-use crate::blockchain::utils::{Difficulty, MAX_DIFFICULTY};
-use chrono::{DateTime, TimeZone, Utc};
+use crate::consensus::{Difficulty, MAX_DIFFICULTY};
+use chrono::{TimeZone, Utc};
 use std::collections::HashMap;
 
 pub struct GenesisConfig {}

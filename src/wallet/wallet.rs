@@ -1,7 +1,7 @@
+use crate::address::{Address, address_from_public_key};
+use crate::transaction::{Transaction, hash_transaction_signing_payload};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use crate::{address::{Address, address_from_public_key}, transaction::hash_transaction_signing_payload};
 use rand_core::OsRng;
-use crate::transaction::Transaction;
 
 pub struct Wallet {
     pub private_key: SigningKey,
@@ -10,7 +10,6 @@ pub struct Wallet {
 }
 
 impl Wallet {
-
     pub fn new() -> Self {
         let private_key = SigningKey::generate(&mut OsRng);
         let public_key = private_key.verifying_key();
@@ -19,7 +18,19 @@ impl Wallet {
         Wallet {
             private_key,
             public_key,
-            address
+            address,
+        }
+    }
+
+    pub fn from_private_key(key: [u8; 32]) -> Self {
+        let private_key = SigningKey::from_bytes(&key);
+        let public_key = private_key.verifying_key();
+        let address = address_from_public_key(&public_key);
+
+        Wallet {
+            private_key,
+            public_key,
+            address,
         }
     }
 
@@ -27,7 +38,13 @@ impl Wallet {
         self.private_key.sign(payload_hash)
     }
 
-    pub fn create_transaction(&self, to: Address, amount: u64, fee: u64, nonce: u64) -> Transaction {
+    pub fn create_transaction(
+        &self,
+        to: Address,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Transaction {
         let from = self.address;
         let payload_hash = hash_transaction_signing_payload(&from, &to, amount, fee, nonce);
 

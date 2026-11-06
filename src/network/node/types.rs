@@ -1,115 +1,67 @@
+//! Реестр соединений и результат их инициализации.
+
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 
-use tokio::{
-    sync::mpsc::{
-        Sender,
-        error::{TrySendError},
-    },
-    task::JoinHandle,
-    time::Instant,
-};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tokio::{sync::mpsc::Sender, task::JoinHandle};
 
-use crate::network::{
-    peer::peer_handle_strategy::PeerStrategy,
-    types::{Handshake, InboundMessage, NetworkMessage, PeerError},
-};
+use crate::network::error::PeerError;
+use crate::network::peer::Peer;
+use crate::network::wire::NetworkMessage;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionDirection {
-    Inbound,
-    Outbound,
-}
-
-#[derive(Debug, Clone)]
-pub enum PeerAction {
-    Continue,
-    Disconnect,
-}
-
-#[derive(Debug, Clone)]
-pub enum PeerState {
-    AwaitingHandshake { deadline: Instant },
-    Active(Handshake),
-}
-pub struct PeerHandle {
-    sender: Sender<NetworkMessage>,
-    state: PeerState,
-    task: JoinHandle<()>,
-    pub connection_id: ConnectionId,
-}
-
-pub enum SendOutcome {
-    Queued,
-    SkippedNotReady,
-}
-
-impl PeerHandle {
-    pub fn new(
-        sender: Sender<NetworkMessage>,
-        state: PeerState,
-        task: JoinHandle<()>,
-        connection_id: ConnectionId,
-    ) -> Self {
-        Self {
-            sender,
-            state,
-            task,
-            connection_id,
-        }
-    }
-
-    pub fn get_state(&self) -> PeerState {
-        self.state.clone()
-    }
-
-    pub fn is_active(&self) -> bool {
-        matches!(self.state, PeerState::Active(_))
-    }
-
-    pub fn send(
-        &self,
-        message: NetworkMessage,
-    ) -> Result<SendOutcome, TrySendError<NetworkMessage>> {
-        if self.is_active() {
-            self.sender.try_send(message)?;
-            return Ok(SendOutcome::Queued);
-        }
-
-        Ok(SendOutcome::SkippedNotReady)
-    }
-
-    pub fn activate(&mut self, handshake: Handshake) {
-        self.state = PeerState::Active(handshake);
-    }
-
-    pub fn on_handshake_receive(
-        &mut self,
-        local_handshake: Handshake,
-        remote_handshake: Handshake,
-    ) -> Result<PeerAction, PeerError> {
-        let state = self.state.clone();
-        state.on_handshake_receive(local_handshake, remote_handshake, self)
-    }
-
-    pub async fn on_message_receive(
-        &self,
-        network_message: NetworkMessage,
-        node_to_app_sender: &Sender<InboundMessage>,
-        addr: SocketAddr,
-    ) -> Result<PeerAction, PeerError> {
-        self.state
-            .on_message_receive(network_message, node_to_app_sender, addr)
-            .await
-    }
-}
-
-impl Drop for PeerHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+use crate::network::peer::types::{ConnectionId, PeerHandle};
 
 pub type SendersToStream = HashMap<SocketAddr, PeerHandle>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnectionId(pub u64);
+/// Результат инициализации соединения, перенесённый из `network::types`
+/// без изменения состава данных.
+pub struct ConnectionInitResult(
+    pub SocketAddr,
+    pub Sender<NetworkMessage>,
+    pub JoinHandle<()>,
+    pub ConnectionId,
+);
+
+pub type ConnectionAttempts = JoinSet<(SocketAddr, Result<Peer, PeerError>)>;
+
+pub struct ConnectionRetryState {
+    pub failures: u32,
+    pub next_attempt_at: Instant,
+    pub enabled: bool,
+}
+
+impl ConnectionRetryState {
+    pub fn new() -> Self {
+        Self {
+            failures: 0,
+            next_attempt_at: Instant::now(),
+            enabled: true,
+        }
+    }
+
+    pub fn record_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+
+        self.next_attempt_at = match self.failures {
+            1 => Instant::now() + Duration::from_secs(rand::random_range(2..=3)),
+            2 => Instant::now() + Duration::from_secs(rand::random_range(4..=6)),
+            3 => Instant::now() + Duration::from_secs(rand::random_range(8..=12)),
+            4 => Instant::now() + Duration::from_secs(rand::random_range(16..=24)),
+            5 => Instant::now() + Duration::from_secs(rand::random_range(32..=45)),
+            _ => Instant::now() + Duration::from_secs(rand::random_range(55..=60)),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.failures = 0;
+        self.next_attempt_at = Instant::now()
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+}
+
+pub type RetryStatesMap = HashMap<SocketAddr, ConnectionRetryState>;

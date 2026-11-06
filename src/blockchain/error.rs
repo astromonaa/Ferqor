@@ -1,4 +1,6 @@
-use crate::blockchain::utils::Difficulty;
+use tokio::sync::mpsc::error::SendError;
+
+use crate::{app::types::AppCommand, consensus::Difficulty, runtime::types::RuntimeError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError {
@@ -49,7 +51,7 @@ pub enum BlockValidationError {
     /// с повторно вычисленным хешем заголовка.
     HashMismatch,
 
-    /// Хеш блока не удовлетворяет текущей сложности Proof of Work.
+    /// Хеш блока не удовлетворяет текущей сложности доказательства работы.
     InvalidProofOfWork,
 
     /// `merkle_root` из заголовка не совпадает с корнем,
@@ -128,5 +130,37 @@ pub enum BlockchainError {
     InvalidDifficulty,
     Mining(MiningError),
     InitializationError(BlockValidationError),
-    GenesisDateTime
+    GenesisDateTime,
+}
+
+#[derive(Debug)]
+pub enum StartupError {
+    ConfigLoad(String),
+    TokioRuntimeRunError(std::io::Error),
+    AppRuntimeError(RuntimeError),
+    SendAppComandFromMain(SendError<AppCommand>),
+}
+
+impl From<dotenv::Error> for StartupError {
+    fn from(value: dotenv::Error) -> Self {
+        StartupError::ConfigLoad(format!("Config load Error: {}", value.to_string()))
+    }
+}
+
+impl From<RuntimeError> for StartupError {
+    fn from(value: RuntimeError) -> Self {
+        StartupError::AppRuntimeError(value)
+    }
+}
+
+impl From<std::io::Error> for StartupError {
+    fn from(value: std::io::Error) -> Self {
+        StartupError::TokioRuntimeRunError(value)
+    }
+}
+
+impl From<SendError<AppCommand>> for StartupError {
+    fn from(value: SendError<AppCommand>) -> Self {
+        StartupError::SendAppComandFromMain(value)
+    }
 }
